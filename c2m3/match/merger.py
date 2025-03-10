@@ -1,7 +1,6 @@
 import copy
 import logging
 from typing import Dict, Optional
-import copy as cpy
 from torch import equal
 
 # import torch
@@ -9,6 +8,7 @@ from torch import equal
 from torch.utils.data import DataLoader
 
 from c2m3.match.frank_wolfe_sync_matching import frank_wolfe_synchronized_matching
+from c2m3.match.frank_wolfe_matching import frank_wolfe_weight_matching
 from c2m3.match.repair import repair_model
 from c2m3.match.utils import (
     apply_permutation_to_statedict,
@@ -85,7 +85,7 @@ class FrankWolfeSynchronizedMerger(Merger):
 
         combinations = get_all_symbols_combinations(symbols)
         canonical_combinations = [(source, target) for (source, target) in combinations if source < target]  # NOQA
-
+        
         perm_indices, _ = frank_wolfe_synchronized_matching(
             params=params,
             perm_spec=self.permutation_spec,
@@ -95,6 +95,16 @@ class FrankWolfeSynchronizedMerger(Merger):
             initialization_method=self.initialization_method,
             keep_soft_perms=self.keep_soft_perms,
         )
+
+        # fixed, permutee = canonical_combinations[0]
+        # perm_indices, _ = frank_wolfe_weight_matching(
+        #     ps=self.permutation_spec,
+        #     fixed=params[fixed],
+        #     permutee=params[permutee],
+        #     max_iter=self.max_iter,
+        #     initialization_method=self.initialization_method,
+        #     keep_soft_perms=self.keep_soft_perms,
+        # )
 
         for symbol in symbols:
             perms_to_apply = {}
@@ -110,6 +120,7 @@ class FrankWolfeSynchronizedMerger(Merger):
                     perm_to_apply = perm_matrix_to_perm_indices(perm)
 
                 perms_to_apply[perm_name] = perm_to_apply
+            print(f'{perms_to_apply=}')
 
             updated_params = apply_permutation_to_statedict(
                 self.permutation_spec, perms_to_apply, get_model(models[symbol]).state_dict()
@@ -154,8 +165,8 @@ class FrankWolfeToReferenceMerger(Merger):
         combinations = get_all_symbols_combinations(symbols)
         canonical_combinations = [(source, target) for (source, target) in combinations if source < target]
 
-        model_params = {symbol: model.model.state_dict() for symbol, model in models.items()}
-        # params = {symbol: copy.deepcopy(get_model(model).state_dict()) for symbol, model in models.items()}
+        # model_params = {symbol: model.model.state_dict() for symbol, model in models.items()}
+        model_params = {symbol: copy.deepcopy(get_model(model).state_dict()) for symbol, model in models.items()}
 
         perm_indices, _ = frank_wolfe_synchronized_matching(
             params=model_params,
@@ -165,9 +176,9 @@ class FrankWolfeToReferenceMerger(Merger):
             max_iter=self.max_iter,
             initialization_method=self.initialization_method,
         )
-        print(f'Before unfactor {perm_indices[ref_model_symbol]=}')
+        print(f'Before unfactor {perm_indices=}')
         perm_indices = unfactor_permutations(perm_indices)
-        print(f'After unfactor {perm_indices[ref_model_symbol]=}')
+        print(f'After unfactor {perm_indices=}')
 
         other_model_symbols = [list(models.keys())[i] for i in range(num_models) if i != ref_model_id]
         print(f'{other_model_symbols=}')
@@ -176,7 +187,7 @@ class FrankWolfeToReferenceMerger(Merger):
             other_model_params = model_params[other_model_symbol]
 
             # Deep copy to ensure tensors are copied as well
-            copy = cpy.deepcopy(other_model_params)
+            cpy = copy.deepcopy(other_model_params)
 
             print(f'{perm_indices[ref_model_symbol][other_model_symbol]=}')
 
@@ -185,7 +196,7 @@ class FrankWolfeToReferenceMerger(Merger):
             )
 
             # Check if the original copy is still the same as the modified one
-            is_equal = are_dicts_equal(copy, other_model_params)
+            is_equal = are_dicts_equal(cpy, other_model_params)
             print(f'{is_equal=}')
 
 

@@ -32,7 +32,7 @@ def frank_wolfe_weight_matching(
     max_iter=200,
     return_perm_history=False,
     num_trials=3,
-    device="cuda",
+    device="cpu",
     keep_soft_perms: bool = False,
     return_all_trial_perm_matrices: bool = False,
     return_step_sizes: bool = False,
@@ -110,7 +110,7 @@ def frank_wolfe_weight_matching_trial(
     initialization_method,
     perm_spec,
     max_iter=100,
-    device="cuda",
+    device="cpu",
     global_step_size=True,
     return_step_sizes=False,
 ):

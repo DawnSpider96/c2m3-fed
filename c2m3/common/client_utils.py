@@ -337,6 +337,14 @@ def get_network_generator_cnn() -> Callable[[], Net]:
 
     return generated_net
 
+# Implementation with different initialization
+def get_network_generator_cnn_random() -> Callable[[], Net]:
+    """Get function to generate a new CNN model."""
+    def generated_net() -> Net:
+        return Net()
+
+    return generated_net
+
 
 # All experiments will have the exact same initialization.
 # All differences in performance will come from training

@@ -1,48 +1,35 @@
-# Copyright 2025 Lorenzo Sani & Alexandru-Andrei Iacob
-# SPDX-License-Identifier: Apache-2.0
-
-"""Flower client for PyTorch."""
-
-from pathlib import Path
-from collections.abc import Callable, Sized
 from logging import INFO
-from typing import cast
+from pathlib import Path
+from typing import Callable, cast
 
-import flwr as fl
-import torch
-from flwr.common.typing import NDArrays, Scalar
-from flwr.common.logger import log
+import flwr
 from torch.nn import Module
-from torch.utils.data import DataLoader
+from flwr.common import log, NDArrays, Scalar, Parameters, ndarrays_to_parameters
+import torch
 
-from c2m3.flower.frank_flower_client import FrankFlowerClient
-
-from .client_utils import (
-    get_model_parameters,
-    set_model_parameters,
-    load_femnist_dataset,
-    train_femnist,
-    test_femnist,
-    get_device,
-)
-from .femnist_dataset import FEMNIST
+from c2m3.common.client_utils import get_model_parameters, load_femnist_dataset, set_model_parameters, test_femnist, train_femnist
+from torch.utils.data import DataLoader, Dataset
 
 
-class FlowerClient(fl.client.NumPyClient):
-    """A client for Flower using PyTorch."""
+
+class FrankFlowerClient(flwr.client.NumPyClient):
+    """Flower client for the FEMNIST dataset."""
+
+    # centralized_partition: Path = dataset_dir / "client_data_mappings" / "centralized"
+    # centralized_mapping: Path = dataset_dir / "client_data_mappings" / "centralized" / "0"
+    # federated_partition: Path = dataset_dir / "client_data_mappings" / "fed_natural"
 
     def __init__(
         self,
         cid: int,
         partition_dir: Path,
         model_generator: Callable[[], Module],
-        data_dir: Path,
+        data_dir: Path
     ) -> None:
-        """Init the client.
+        """Init the client with its unique id and the folder to load data from.
 
-        It uses its unique id and the directory from which it can load its data.
-
-        Args:
+        Parameters
+        ----------
             cid (int): Unique client id for a client used to map it to its data
                 partition
             partition_dir (Path): The directory containing data for each
@@ -50,17 +37,24 @@ class FlowerClient(fl.client.NumPyClient):
             model_generator (Callable[[], Module]): The model generator function
         """
         self.cid = cid
-        log(INFO, "Creating client with cid: %s", self.cid)
+        log(INFO, "cid: %s", self.cid)
         self.partition_dir = partition_dir
-        self.data_dir = data_dir
-        self.device = get_device()
+        self.device = str(
+            torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        )
         self.model_generator: Callable[[], Module] = model_generator
-        self.properties: dict[str, Scalar] = {"tensor_type": "numpy.ndarray"}
+        self.properties: dict[str, Scalar] = {
+            "tensor_type": "numpy.ndarray",
+            "partition": self.partition_dir,
+            "cid": self.cid
+            }
+        self.data_dir = data_dir
 
     def set_parameters(self, parameters: NDArrays) -> Module:
         """Load weights inside the network.
 
-        Args:
+        Parameters
+        ----------
             parameters (NDArrays): set of weights to be loaded.
 
         Returns
@@ -74,10 +68,12 @@ class FlowerClient(fl.client.NumPyClient):
         """Return weights from a given model.
 
         If no model is passed, then a local model is created.
-        This can be used to initialise a model in the server.
+        This can be used to initialise a model in the
+        server.
         The config param is not used but is mandatory in Flower.
 
-        Args:
+        Parameters
+        ----------
             config (dict[int, Scalar]): dictionary containing configuration info.
 
         Returns
@@ -92,9 +88,10 @@ class FlowerClient(fl.client.NumPyClient):
     ) -> tuple[NDArrays, int, dict]:
         """Receive and train a model on the local client data.
 
-        It uses the instruction passed through the config dict.
+        It uses parameters from the config dict
 
-        Args:
+        Parameters
+        ----------
             net (NDArrays): Pytorch model parameters
             config (dict[str, Scalar]): dictionary describing the training parameters
 
@@ -109,6 +106,9 @@ class FlowerClient(fl.client.NumPyClient):
         net.to(self.device)
 
         train_loader: DataLoader = self._create_data_loader(config, name="train")
+        self.properties["train_loader"] = train_loader
+        print("MARKER")
+        print(f'{self.properties=}')
         train_loss = self._train(net, train_loader=train_loader, config=config)
         return get_model_parameters(net), len(train_loader), {"train_loss": train_loss}
 
@@ -117,9 +117,10 @@ class FlowerClient(fl.client.NumPyClient):
     ) -> tuple[float, int, dict]:
         """Receive and test a model on the local client data.
 
-        It uses the instruction passed through the config dict.
+        It uses parameters from the config dict
 
-        Args:
+        Parameters
+        ----------
             net (NDArrays): Pytorch model parameters
             config (dict[str, Scalar]): dictionary describing the testing parameters
 
@@ -132,13 +133,15 @@ class FlowerClient(fl.client.NumPyClient):
         net.to(self.device)
 
         test_loader: DataLoader = self._create_data_loader(config, name="test")
+        self.properties["test_loader"] = test_loader
         loss, accuracy = self._test(net, test_loader=test_loader, config=config)
         return loss, len(test_loader), {"local_accuracy": accuracy}
 
     def _create_data_loader(self, config: dict[str, Scalar], name: str) -> DataLoader:
         """Create the data loader using the specified config parameters.
 
-        Args:
+        Parameters
+        ----------
             config (dict[str, Scalar]): dictionary containing dataloader and dataset
                 parameters
             mode (str): Load the training or testing set for the client
@@ -153,12 +156,12 @@ class FlowerClient(fl.client.NumPyClient):
         return DataLoader(
             dataset=dataset,
             batch_size=batch_size,
-            shuffle=(name == "train"),
+            shuffle=True,
             num_workers=num_workers,
             drop_last=(name == "train"),
         )
 
-    def _load_dataset(self, name: str) -> FEMNIST:
+    def _load_dataset(self, name: str) -> Dataset:
         full_file: Path = self.partition_dir / str(self.cid)
         return load_femnist_dataset(
             mapping=full_file,
@@ -184,7 +187,7 @@ class FlowerClient(fl.client.NumPyClient):
         )
 
     def _test(
-        self, net: torch.nn.Module, test_loader: DataLoader, config: dict[str, Scalar]
+        self, net: Module, test_loader: DataLoader, config: dict[str, Scalar]
     ) -> tuple[float, float]:
         return test_femnist(
             net=net,
@@ -197,15 +200,15 @@ class FlowerClient(fl.client.NumPyClient):
     def get_properties(self, config: dict[str, Scalar]) -> dict[str, Scalar]:
         """Return properties for this client.
 
-        Args:
+        Parameters
+        ----------
             config (dict[str, Scalar]): Options to be used for selecting specific
-                properties.
+            properties.
 
         Returns
         -------
             dict[str, Scalar]: Returned properties.
         """
-        # pylint: disable=unused-argument
         return self.properties
 
     def get_train_set_size(self) -> int:
@@ -215,7 +218,7 @@ class FlowerClient(fl.client.NumPyClient):
         -------
             int: train set size of the client.
         """
-        return len(cast(Sized, self._load_dataset("train")))
+        return len(self._load_dataset("train"))  # type: ignore[reportArgumentType]
 
     def get_test_set_size(self) -> int:
         """Return the client test set size.
@@ -224,89 +227,4 @@ class FlowerClient(fl.client.NumPyClient):
         -------
             int: test set size of the client.
         """
-        return len(cast(Sized, self._load_dataset("test")))
-
-
-def get_flower_client_generator(
-    model_generator: Callable[[], Module],
-    partition_dir: Path,
-    data_dir: Path,
-    mapping_fn: Callable[[int], int] | None = None,
-) -> Callable[[str], FlowerClient]:
-    """Wrap the client instance generator.
-
-    This provides the client generator with a model generator function.
-    Also, the partition directory must be passed.
-    A mapping function could be used for filtering/ordering clients.
-
-    Args:
-        model_generator (Callable[[], Module]): model generator function.
-        partition_dir (Path): directory containing the partition.
-        mapping_fn (Optional[Callable[[int], int]]): function mapping sorted/filtered
-            ids to real cid.
-
-    Returns
-    -------
-        Callable[[str], FlowerClient]: client instance.
-    """
-
-    def client_fn(cid: str) -> FlowerClient:
-        """Create a single client instance given the client id `cid`.
-
-        Args:
-            cid (str): client id, Flower requires this to be of type str.
-
-        Returns
-        -------
-            FlowerClient: client instance.
-        """
-        return FlowerClient(
-            cid=mapping_fn(int(cid)) if mapping_fn is not None else int(cid),
-            partition_dir=partition_dir,
-            model_generator=model_generator,
-            data_dir=data_dir,
-        )
-
-    return client_fn
-
-def get_frank_flower_client_generator(
-    model_generator: Callable[[], Module],
-    partition_dir: Path,
-    data_dir: Path,
-    mapping_fn: Callable[[int], int] | None = None,
-) -> Callable[[str], FlowerClient]:
-    """Wrap the client instance generator.
-
-    This provides the client generator with a model generator function.
-    Also, the partition directory must be passed.
-    A mapping function could be used for filtering/ordering clients.
-
-    Args:
-        model_generator (Callable[[], Module]): model generator function.
-        partition_dir (Path): directory containing the partition.
-        mapping_fn (Optional[Callable[[int], int]]): function mapping sorted/filtered
-            ids to real cid.
-
-    Returns
-    -------
-        Callable[[str], FlowerClient]: client instance.
-    """
-
-    def client_fn(cid: str) -> FlowerClient:
-        """Create a single client instance given the client id `cid`.
-
-        Args:
-            cid (str): client id, Flower requires this to be of type str.
-
-        Returns
-        -------
-            FlowerClient: client instance.
-        """
-        return FrankFlowerClient(
-            cid=mapping_fn(int(cid)) if mapping_fn is not None else int(cid),
-            partition_dir=partition_dir,
-            model_generator=model_generator,
-            data_dir=data_dir,
-        )
-
-    return client_fn
+        return len(self._load_dataset("test"))  # type: ignore[reportArgumentType]

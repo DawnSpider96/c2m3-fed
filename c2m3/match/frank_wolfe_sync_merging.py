@@ -5,7 +5,7 @@ from c2m3.match.permutation_spec import CNNPermutationSpecBuilder
 from c2m3.match.merger import FrankWolfeSynchronizedMerger, FrankWolfeToReferenceMerger
 from c2m3.match.utils import restore_original_weights
 
-def frank_wolfe_synchronized_merging(models: List[MyLightningModule]):
+def frank_wolfe_synchronized_merging(models: List[MyLightningModule], train_loaders):
 
     symbols_to_models = {}
     for index, model in enumerate(models):
@@ -27,14 +27,19 @@ def frank_wolfe_synchronized_merging(models: List[MyLightningModule]):
     restore_original_weights(symbols_to_models, model_orig_weights)
 
 
-    model_merger = FrankWolfeToReferenceMerger(
+    # model_merger = FrankWolfeToReferenceMerger(
+    #     name="FrankWolfeSync", 
+    #     permutation_spec=permutation_spec,
+    #     initialization_method="identity" #identity, random, sinkhorn, LAP, bistochastic_barycenter
+    #     )
+    model_merger = FrankWolfeSynchronizedMerger(
         name="FrankWolfeSync", 
         permutation_spec=permutation_spec,
         initialization_method="identity" #identity, random, sinkhorn, LAP, bistochastic_barycenter
         )
-    merged_model = model_merger(symbols_to_models)
+    merged_model, repaired_model, models_permuted_to_universe = model_merger(symbols_to_models, train_loader=train_loaders)
 
     print(f"Successfully merged models.")
 
-    return merged_model
+    return repaired_model
 

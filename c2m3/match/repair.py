@@ -82,7 +82,7 @@ def make_tracked_net(model):
     return tracked_model.eval()
 
 
-def reset_bn_stats(model, epochs, loader):
+def reset_bn_stats(model, loader, epochs):
     """
     Reset batchnorm stats. We use the train loader with data augmentation as this gives better results.
     """

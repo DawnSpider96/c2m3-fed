@@ -1,4 +1,5 @@
 from logging import DEBUG, WARNING
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from flwr.common import (
@@ -16,6 +17,8 @@ from flwr.common import (
 from flwr.common.logger import log
 from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
+from flwr.simulation.ray_transport.fn_client_proxy import FnClientProxy
+from flwr.common import GetPropertiesIns
 
 from flwr.server.strategy.aggregate import aggregate, weighted_loss_avg
 from flwr.server.strategy.strategy import Strategy
@@ -23,11 +26,16 @@ from flwr.server.strategy.strategy import Strategy
 from c2m3.common.client_utils import (
     Net, 
     get_network_generator_cnn, 
-    get_model_parameters, 
+    get_model_parameters,
+    load_femnist_dataset, 
     set_model_parameters
 )
 from c2m3.modules.pl_module import MyLightningModule
 from c2m3.match.frank_wolfe_sync_merging import frank_wolfe_synchronized_merging
+
+from c2m3.flower.multiple_init_mod import initialize_multiple_parameters
+
+from torch.utils.data import DataLoader, Dataset
 
 WARNING_MIN_AVAILABLE_CLIENTS_TOO_LOW = """
 Setting `min_available_clients` lower than `min_fit_clients` or
@@ -38,9 +46,14 @@ than or equal to the values of `min_fit_clients` and `min_evaluate_clients`.
 
 NUM_CLASSES_FEMNIST = 62
 
+# Todo dont hardcode these
+home_dir = Path.cwd() / ".."
+dataset_dir: Path = home_dir / "femnist"
+data_dir: Path = dataset_dir / "data"
+
 # weights_results: List(Tuple(NDArray parameters, number of examples))
 # return NDArray
-def frank_wolfe_aggregate(weights_results):
+def frank_wolfe_aggregate(weights_results, train_loaders):
     
     lightning_modules = []
     network_generator = get_network_generator_cnn()
@@ -53,7 +66,7 @@ def frank_wolfe_aggregate(weights_results):
         mlm = MyLightningModule(net, num_classes=NUM_CLASSES_FEMNIST)
         lightning_modules.append(mlm)
     
-    merged_lightning_module = frank_wolfe_synchronized_merging(lightning_modules)
+    merged_lightning_module = frank_wolfe_synchronized_merging(lightning_modules, train_loaders)
 
     return get_model_parameters(merged_lightning_module.model)
 
@@ -239,11 +252,35 @@ class FrankWolfeSync(Strategy):
             return None, {}
         
         # Convert results
-        weights_results = [
-            (parameters_to_ndarrays(fit_res.parameters), fit_res.num_examples)
-            for _, fit_res in results
-        ]
-        parameters_aggregated = ndarrays_to_parameters(frank_wolfe_aggregate(weights_results))
+        weights_results = []
+        train_loaders: List[DataLoader] = []
+        # Argument doesn't matter
+        config = self.on_fit_config_fn(0)
+        ins: GetPropertiesIns = GetPropertiesIns(config={})
+        for client_proxy, fit_res in results:
+            weights_results.append(
+                (parameters_to_ndarrays(fit_res.parameters), fit_res.num_examples)
+            )
+            props = client_proxy.get_properties(ins=ins, timeout=None).properties
+            # Copied code from main
+            # TODO Dont hardcode
+            batch_size = int(config["batch_size"])
+            num_workers = int(config["num_workers"])
+            full_file: Path = props["partition"] / str(props["cid"])
+            dataset = load_femnist_dataset(
+                mapping=full_file,
+                name="train",
+                data_dir=data_dir,
+            )
+            train_loader = DataLoader(
+                dataset=dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                drop_last=True,
+            )
+            train_loaders.append(train_loader)
+        parameters_aggregated = ndarrays_to_parameters(frank_wolfe_aggregate(weights_results, train_loaders))
 
         # Aggregate custom metrics if aggregation fn was provided
         metrics_aggregated = {}
