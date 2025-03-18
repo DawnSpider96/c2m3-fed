@@ -1,4 +1,7 @@
 import torch.nn as nn
+from c2m3.models.cnn import CNN
+from c2m3.models.mlp import MLP
+# Import other model classes as needed
 
 
 class LayerNorm2d(nn.Module):
@@ -30,3 +33,26 @@ class BatchNorm2d(nn.Module):
 
     def forward(self, x):
         return self.layer_norm(x)
+
+
+def get_model_class(model_name):
+    """
+    Factory function to get model class based on model name.
+    
+    Args:
+        model_name (str): Name of the model to get ('cnn', 'mlp', etc.)
+        
+    Returns:
+        function: A constructor function for the requested model.
+    """
+    model_registry = {
+        "cnn": CNN,
+        "mlp": MLP,
+        # Add more models here as they are implemented
+    }
+    
+    model_name = model_name.lower()
+    if model_name not in model_registry:
+        raise ValueError(f"Unknown model: {model_name}. Available models: {list(model_registry.keys())}")
+    
+    return model_registry[model_name]

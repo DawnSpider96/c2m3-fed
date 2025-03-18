@@ -266,6 +266,7 @@ class FrankWolfeSync(Strategy):
             # TODO Dont hardcode
             batch_size = int(config["batch_size"])
             num_workers = int(config["num_workers"])
+            print(f'{props=}')
             full_file: Path = props["partition"] / str(props["cid"])
             dataset = load_femnist_dataset(
                 mapping=full_file,

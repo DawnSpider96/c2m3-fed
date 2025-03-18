@@ -49,6 +49,7 @@ class FrankWolfeSynchronizedMerger(Merger):
         average_in_universe=True,
         keep_soft_perms=False,
         max_iter=200,
+        score_tolerance=1e-6,
         # Originally cuda
         device="cpu",
     ):
@@ -57,6 +58,7 @@ class FrankWolfeSynchronizedMerger(Merger):
         super().__init__(name, permutation_spec)
 
         self.max_iter = max_iter
+        self.score_tolerance = score_tolerance
         self.average_in_universe = average_in_universe
         self.initialization_method = initialization_method
         self.keep_soft_perms = keep_soft_perms
@@ -94,17 +96,8 @@ class FrankWolfeSynchronizedMerger(Merger):
             max_iter=self.max_iter,
             initialization_method=self.initialization_method,
             keep_soft_perms=self.keep_soft_perms,
+            score_tolerance=self.score_tolerance,
         )
-
-        # fixed, permutee = canonical_combinations[0]
-        # perm_indices, _ = frank_wolfe_weight_matching(
-        #     ps=self.permutation_spec,
-        #     fixed=params[fixed],
-        #     permutee=params[permutee],
-        #     max_iter=self.max_iter,
-        #     initialization_method=self.initialization_method,
-        #     keep_soft_perms=self.keep_soft_perms,
-        # )
 
         for symbol in symbols:
             perms_to_apply = {}

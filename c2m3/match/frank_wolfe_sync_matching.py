@@ -21,13 +21,14 @@ pylogger = logging.getLogger(__name__)
 
 
 def frank_wolfe_synchronized_matching(
-    params: Dict[str, LightningModule],
+    params: Dict[str, Dict], # Symbol to State dict of model
     perm_spec: PermutationSpec,
     symbols: List[str],
     combinations: List[Tuple],
     max_iter: int,
     initialization_method: str,
     keep_soft_perms: bool = False,
+    score_tolerance: float = 1e-6,
     device=None,
     verbose=False,
 ):
@@ -122,7 +123,7 @@ def frank_wolfe_synchronized_matching(
         step_sizes.append(step_size)
         # perm_history.append(perm_matrices)
 
-        if (new_obj - old_obj) < 1e-6:
+        if (new_obj - old_obj) < score_tolerance:
             patience_steps += 1
         else:
             patience_steps = 0

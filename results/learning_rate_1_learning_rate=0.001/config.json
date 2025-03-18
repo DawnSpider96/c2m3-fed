@@ -1,0 +1,33 @@
+{
+    "experiment_name": "learning_rate_1_learning_rate=0.001",
+    "dataset_name": "femnist",
+    "model_name": "cnn",
+    "seed": 42,
+    "data_dir": "/home/dawn/repos/c2m3-federated/c2m3/data",
+    "num_models": 4,
+    "epochs_per_model": [
+        30,
+        30,
+        30,
+        30
+    ],
+    "batch_size": 64,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "data_distribution": "iid",
+    "non_iid_alpha": 0.5,
+    "classes_per_partition": 1,
+    "initialization_type": "identical",
+    "merging_methods": [
+        "c2m3",
+        "fedavg"
+    ],
+    "c2m3_max_iter": 100,
+    "c2m3_score_tolerance": 1e-06,
+    "c2m3_init_method": "identity",
+    "ties_alpha": 0.5,
+    "eval_batch_size": 128,
+    "output_dir": "./results",
+    "save_models": false,
+    "save_results": true
+}

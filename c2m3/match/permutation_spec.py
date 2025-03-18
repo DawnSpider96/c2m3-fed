@@ -332,7 +332,7 @@ def transformer_block_axes(depth, p_in, p_out):
 
     return all_axes
 
-
+# Joseph-proof
 class CNNPermutationSpecBuilder(PermutationSpecBuilder):
     def __init__(self) -> None:
         super().__init__()
