@@ -151,10 +151,14 @@ def train_femnist(
     """
     net.train()
     running_loss, total = 0.0, 0
-    for _ in range(epochs):
+    for epoch in range(epochs):
         running_loss = 0.0
         total = 0
-        for i, (data, labels) in enumerate(train_loader):
+        # Calculate total batches
+        total_batches = len(train_loader) if max_batches is None else min(max_batches, len(train_loader))
+        desc = f"Training [Epoch {epoch+1}/{epochs}]"
+        
+        for i, (data, labels) in enumerate(tqdm(train_loader, desc=desc, total=total_batches, leave=True)):
             if max_batches is not None and i >= max_batches:
                 break
             data, labels = data.to(device), labels.to(device)
@@ -164,6 +168,12 @@ def train_femnist(
             total += labels.size(0)
             loss.backward()
             optimizer.step()
+    
+    # Check for division by zero
+    if total == 0:
+        print("Warning: No data was processed during training. Dataset might be empty.")
+        return 0.0  # Return 0 loss instead of causing division by zero
+    
     return running_loss / total
 
 
@@ -192,9 +202,13 @@ def test_femnist(
     batch_cnt = 0
     correct, total, loss = 0, 0, 0.0
     net.eval()
+    
+    # Calculate total batches
+    total_batches = len(test_loader) if max_batches is None else min(max_batches, len(test_loader))
+    desc = f"Testing [{len(test_loader.dataset)} samples]"
 
     with torch.no_grad():
-        for data, labels in tqdm(test_loader):
+        for data, labels in tqdm(test_loader, desc=desc, total=total_batches, leave=True):
 
             if max_batches is not None and batch_cnt >= max_batches:
                 break
@@ -207,7 +221,12 @@ def test_femnist(
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
-
+    
+    # Check for division by zero (empty dataset)
+    if total == 0:
+        print("Warning: No data was processed during testing. Test dataset might be empty.")
+        return 0.0, 0.0  # Return zeros for both loss and accuracy
+        
     accuracy = correct / total
     return loss, accuracy
 

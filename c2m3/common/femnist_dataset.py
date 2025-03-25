@@ -57,7 +57,15 @@ class FEMNIST(Dataset):
         sample_path, label = self.data[index]
 
         # Convert to the full path
-        full_sample_path: Path = self.data_dir / self.name / sample_path
+        # Check if path starts with 'train_' and load from 'train' directory
+        if sample_path.startswith("train_"):
+            # Use 'train' directory for paths with 'train_' prefix
+            full_sample_path: Path = self.data_dir / "train" / sample_path
+        else:
+            # Normal case, use the specified name directory
+            # Map "validation" to "val" if needed
+            dir_name = "val" if self.name == "validation" else self.name
+            full_sample_path: Path = self.data_dir / dir_name / sample_path
 
         img: ImageType = Image.open(full_sample_path).convert("L")
 

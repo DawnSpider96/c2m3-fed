@@ -12,7 +12,9 @@ import csv
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, Subset
+from torch.utils.data import Dataset, Subset, random_split
+from torchvision import transforms
+from c2m3.common.client_utils import load_femnist_dataset
 from c2m3.common.femnist_dataset import FEMNIST
 
 logger = logging.getLogger(__name__)
@@ -90,6 +92,17 @@ class IIDPartitioner(DatasetPartitioner):
     IID (Independent and Identically Distributed) partitioning strategy.
     Randomly shuffles and splits the dataset into equal-sized partitions.
     """
+    def __init__(self, seed: Optional[int] = None):
+        """
+        Initialize the IID partitioner.
+        
+        Args:
+            seed: Optional random seed for reproducibility. If provided, 
+                 uses a dedicated random generator for consistent results.
+        """
+        self.seed = seed
+        self.random_generator = random.Random(seed) if seed is not None else random
+    
     def partition(self, dataset: Dataset, num_partitions: int) -> List[Dataset]:
         """
         Partition the dataset in an IID fashion.
@@ -103,7 +116,7 @@ class IIDPartitioner(DatasetPartitioner):
         """
         # Generate random indices
         indices = list(range(len(dataset)))
-        random.shuffle(indices)
+        self.random_generator.shuffle(indices)
         
         # Calculate partition size
         partition_size = len(dataset) // num_partitions
@@ -116,8 +129,41 @@ class IIDPartitioner(DatasetPartitioner):
             partition_indices = indices[start_idx:end_idx]
             partitions.append(Subset(dataset, partition_indices))
         
-        logger.info(f"Created {num_partitions} IID partitions with ~{partition_size} samples each")
+        seed_info = f" with seed={self.seed}" if self.seed is not None else ""
+        logger.info(f"Created {num_partitions} IID partitions{seed_info} with ~{partition_size} samples each")
         return partitions
+
+
+class SeededIIDPartitioner(DatasetPartitioner):
+    """
+    DEPRECATED: Use IIDPartitioner with a seed parameter instead.
+    This class is maintained for backward compatibility.
+    """
+    def __init__(self, seed: int):
+        """
+        Initialize the seeded IID partitioner.
+        
+        Args:
+            seed: Random seed for reproducibility
+        """
+        logger.warning("SeededIIDPartitioner is deprecated. Use IIDPartitioner with seed parameter instead.")
+        self.random_generator = random.Random(seed)
+        self.seed = seed
+    
+    def partition(self, dataset: Dataset, num_partitions: int) -> List[Dataset]:
+        """
+        Partition the dataset in an IID fashion with reproducible randomness.
+        
+        Args:
+            dataset: The dataset to partition
+            num_partitions: The number of partitions to create
+            
+        Returns:
+            A list of dataset partitions
+        """
+        # Create and use an IIDPartitioner instead
+        partitioner = IIDPartitioner(seed=self.seed)
+        return partitioner.partition(dataset, num_partitions)
 
 
 class DirichletPartitioner(DatasetPartitioner):
@@ -378,56 +424,80 @@ class FEMNISTNaturalPartitioner(DatasetPartitioner):
     """
     Use FEMNIST's natural partitioning by writer.
     Each partition corresponds to a different writer.
+    
+    NOTE: Test set extraction should be done before using this partitioner.
     """
-    def __init__(self, data_dir: Union[str, Path]):
+    def __init__(self, data_dir: Union[str, Path], seed: int):
         """
         Initialize the FEMNIST natural partitioner.
         
         Args:
             data_dir: Directory containing the FEMNIST dataset
+            seed: Random seed for selection of clients
         """
         self.data_dir = Path(data_dir) if isinstance(data_dir, str) else data_dir
+        self.seed = seed
+        self.random_generator = random.Random(seed)
     
-    def partition(self, dataset: Dataset, num_partitions: int) -> List[Dataset]:
+    def partition(self, available_client_ids: List[str], num_partitions: int, test_sample_paths: Optional[set] = None) -> List[Dataset]:
         """
-        Use FEMNIST's natural partitioning.
+        Use FEMNIST's natural partitioning after test set extraction.
         
         Args:
-            dataset: The FEMNIST dataset (only used for transforms)
+            available_client_ids: List of available client IDs to choose from
             num_partitions: Maximum number of partitions to create
+            test_sample_paths: Set of sample paths that belong to the test set (to be excluded)
             
         Returns:
             A list of FEMNIST datasets, one per writer
         """
         # Get the mapping directory
-        mapping_dir = self.data_dir / "femnist" / "client_data_mappings"
+        mapping_dir = self.data_dir / "femnist" / "client_data_mappings" / "fed_natural"
         
         # Ensure the directory exists
         if not mapping_dir.exists():
-            raise FileNotFoundError(f"FEMNIST client mappings not found at {mapping_dir}")
+            raise FileNotFoundError(f"FEMNIST natural partitioning directory not found at {mapping_dir}")
         
-        # Get available client mappings
-        client_files = list(mapping_dir.glob("*.csv"))
-        if not client_files:
-            raise ValueError(f"No client mapping files found in {mapping_dir}")
+        # Validate available_client_ids
+        if not available_client_ids:
+            available_client_ids = [d.name for d in mapping_dir.iterdir() if d.is_dir()]
+            
+        if not available_client_ids:
+            raise ValueError(f"No client directories found in {mapping_dir}")
         
         # Select num_partitions clients
-        selected_clients = client_files[:num_partitions]
+        num_to_select = min(num_partitions, len(available_client_ids))
+        selected_clients = self.random_generator.sample(available_client_ids, num_to_select)
+        
         if len(selected_clients) < num_partitions:
             logger.warning(f"Only {len(selected_clients)} FEMNIST clients available, requested {num_partitions}")
         
-        # Get transform from the original dataset if available
-        transform = getattr(dataset, 'transform', None)
-        
-        # Create datasets for each selected client
+        # Create datasets for each selected client, filtering out test samples if needed
         partitions = []
-        for client_file in selected_clients:
-            client_dataset = FEMNIST(
-                mapping=client_file.parent,
+        for cid in selected_clients:
+            # Load the client dataset
+            client_dataset = load_femnist_dataset(
                 data_dir=self.data_dir / "femnist" / "data",
-                name="train",
-                transform=transform
+                mapping=mapping_dir / str(cid),
+                name="train"
             )
+            
+            # If we have test sample paths, filter them out
+            if test_sample_paths:
+                client_samples = client_dataset._load_dataset()
+                filtered_samples = [sample for sample in client_samples if sample[0] not in test_sample_paths]
+                
+                if not filtered_samples:
+                    logger.warning(f"Client {cid} has no training samples after filtering out test samples")
+                    continue
+                
+                # Create a filtered dataset
+                from c2m3.experiments.corrected_partition_data import FEMNISTFromSamples
+                client_dataset = FEMNISTFromSamples(
+                    samples=filtered_samples,
+                    data_dir=self.data_dir / "femnist" / "data"
+                )
+            
             partitions.append(client_dataset)
         
         logger.info(f"Created {len(partitions)} natural FEMNIST partitions")
@@ -438,116 +508,116 @@ class FEMNISTIIDPartitioner(DatasetPartitioner):
     """
     Create IID partitions for FEMNIST dataset.
     
-    This partitioner uses the centralized mapping file to create IID partitions
+    This partitioner divides FEMNIST training samples across clients in an IID fashion.
+    NOTE: Test set extraction should be done before using this partitioner.
     """
-    def __init__(self, data_dir: Union[str, Path], partition_dir_name: str = "fed_iid"):
+    def __init__(self, data_dir: Union[str, Path], seed: int, samples_per_partition: Optional[int] = None):
         """
         Initialize the FEMNIST IID partitioner.
         
         Args:
             data_dir: Directory containing the FEMNIST dataset
-            partition_dir_name: Name for the IID partition directory
+            seed: Random seed for reproducibility
+            samples_per_partition: If provided, each partition will have exactly this many samples
+                                 If None, divides the dataset evenly among partitions
         """
         self.data_dir = Path(data_dir) if isinstance(data_dir, str) else data_dir
-        self.partition_dir_name = partition_dir_name
+        self.random_generator = random.Random(seed)
+        self.seed = seed
+        self.samples_per_partition = samples_per_partition
     
-    def partition(self, dataset: Dataset, num_partitions: int) -> List[Dataset]:
+    def partition(self, training_samples: List[Tuple[str, int]], num_partitions: int) -> List[Dataset]:
         """
-        Create IID partitions for FEMNIST.
-        
-        The function:
-        1. Loads a centralized dataset
-        2. Randomly shuffles and divides data across clients
-        3. Creates mapping files for each client
-        4. Returns FEMNIST dataset objects for each client
+        Create IID partitions for FEMNIST training data.
         
         Args:
-            dataset: The dataset to partition (used mainly for transforms)
+            training_samples: List of (sample_path, label) tuples for training
             num_partitions: Number of partitions to create
             
         Returns:
-            A list of FEMNIST datasets, one per client
+            A list of FEMNIST datasets, one per partition
         """
-        # Step 1: Set up directories
-        root_mapping_dir = self.data_dir / "femnist" / "client_data_mappings"
-        partition_dir = root_mapping_dir / self.partition_dir_name
+        # Shuffle samples for IID distribution
+        shuffled_samples = list(training_samples)
+        self.random_generator.shuffle(shuffled_samples)
         
-        # Create partition directory if it doesn't exist
-        partition_dir.mkdir(exist_ok=True, parents=True)
-        
-        # Step 2: Load the centralized dataset (all samples)
-        # We'll use the existing centralized mapping if available
-        centralized_mapping = root_mapping_dir / "centralized" / "0"
-        if not centralized_mapping.exists():
-            raise FileNotFoundError(f"Centralized mapping not found at {centralized_mapping}")
-        
-        # Load centralized dataset for both train and test
-        transform = getattr(dataset, 'transform', None)
-        
-        # Collect all samples
-        all_samples = {}
-        for split in ["train", "test"]:
-            central_dataset = FEMNIST(
-                mapping=centralized_mapping,
-                data_dir=self.data_dir / "femnist" / "data",
-                name=split,
-                transform=transform
-            )
-            all_samples[split] = central_dataset._load_dataset()
-        
-        # Step 3: Create IID partitions
         partitions = []
         
-        for split in ["train", "test"]:
-            samples = all_samples[split]
-            # Shuffle samples for IID distribution
-            shuffled_samples = list(samples)
-            random.shuffle(shuffled_samples)
+        if self.samples_per_partition is not None:
+            # Fixed-size partitioning: Each partition has exactly samples_per_partition samples
+            samples_needed = self.samples_per_partition * num_partitions
             
-            # Calculate samples per partition
+            # Check if we have enough samples
+            if samples_needed > len(shuffled_samples):
+                logger.warning(
+                    f"Not enough samples for {num_partitions} partitions with {self.samples_per_partition} samples each. "
+                    f"Need {samples_needed}, but only have {len(shuffled_samples)}. Will use all available samples."
+                )
+                # Fall back to even division
+                samples_per_partition = len(shuffled_samples) // num_partitions
+            else:
+                samples_per_partition = self.samples_per_partition
+                # We may not use all samples if fixed size is specified
+                shuffled_samples = shuffled_samples[:samples_needed]
+        else:
+            # Even division: Divide all samples evenly among partitions
             samples_per_partition = len(shuffled_samples) // num_partitions
-            
-            # Distribute samples
-            for i in range(num_partitions):
-                # Create client directory if not exists
-                client_dir = partition_dir / str(i)
-                client_dir.mkdir(exist_ok=True)
-                
-                # Get samples for this client
-                start_idx = i * samples_per_partition
-                end_idx = start_idx + samples_per_partition if i < num_partitions - 1 else len(shuffled_samples)
-                client_samples = shuffled_samples[start_idx:end_idx]
-                
-                # Create CSV mapping file
-                csv_path = (client_dir / split).with_suffix(".csv")
-                
-                # Create CSV mapping
-                with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["user_id", "sample_path", "writer_id", "label_id"])
-                    
-                    # For each sample, we only have the path and label from FEMNIST._load_dataset()
-                    # We'll use placeholder values for user_id and writer_id
-                    for sample_path, label in client_samples:
-                        writer.writerow([i, sample_path, i, label])
-                
-                # Create PT file for faster loading
-                pt_path = (client_dir / split).with_suffix(".pt")
-                torch.save(client_samples, pt_path)
         
-        # Step 4: Create and return FEMNIST dataset objects for each partition
+        # Create partitions
         for i in range(num_partitions):
-            client_dir = partition_dir / str(i)
-            client_dataset = FEMNIST(
-                mapping=client_dir,
-                data_dir=self.data_dir / "femnist" / "data",
-                name="train",  # Default to train, client will specify
-                transform=transform
-            )
-            partitions.append(client_dataset)
+            start_idx = i * samples_per_partition
+            end_idx = start_idx + samples_per_partition
+            
+            # Make sure we don't go beyond available samples
+            if end_idx <= len(shuffled_samples):
+                partition_samples = shuffled_samples[start_idx:end_idx]
+                
+                # Create a FEMNIST dataset from these samples
+                partition = self._create_dataset_from_samples(partition_samples)
+                partitions.append(partition)
         
-        logger.info(f"Created {num_partitions} IID FEMNIST partitions with ~{samples_per_partition} samples each")
+        if self.samples_per_partition is not None:
+            logger.info(f"Created {len(partitions)} IID FEMNIST partitions with exactly {samples_per_partition} samples each")
+        else:
+            logger.info(f"Created {len(partitions)} IID FEMNIST partitions with ~{samples_per_partition} samples each")
+        
         return partitions
+    
+    def _create_dataset_from_samples(self, samples: List[Tuple[str, int]]) -> Dataset:
+        """
+        Create a FEMNIST dataset from a list of samples.
+        
+        Args:
+            samples: List of (sample_path, label) tuples
+            
+        Returns:
+            A FEMNIST dataset
+        """
+        # Create a temporary directory to store the mapping file
+        import tempfile
+        import csv
+        import os
+        
+        temp_dir = Path(tempfile.mkdtemp())
+        train_pt_path = temp_dir / "train.pt"
+        
+        # Save samples to a PT file for faster loading
+        torch.save(samples, train_pt_path)
+        
+        # Create CSV mapping file
+        train_csv_path = temp_dir / "train.csv"
+        with open(train_csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(["user_id", "sample_path", "writer_id", "label_id"])
+            for sample_path, label in samples:
+                writer.writerow([0, sample_path, 0, label])
+        
+        # Create and return FEMNIST dataset
+        return load_femnist_dataset(
+            mapping=temp_dir,
+            data_dir=self.data_dir / "femnist" / "data",
+            name="train"
+        )
 
 
 class FEMNISTByIDPartitioner(DatasetPartitioner):
@@ -598,16 +668,31 @@ class FEMNISTByIDPartitioner(DatasetPartitioner):
         
         # Get transform from the original dataset if available
         transform = getattr(dataset, 'transform', None)
+        if transform is None:
+            # Create a default transform that converts PIL Images to tensors
+            from torchvision import transforms
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+            ])
+            logger.info("Using default ToTensor transform for FEMNIST")
+        else:
+            logger.info("Using transform from dataset")
         
         # Determine client IDs to use
         client_ids = self.client_ids
         if client_ids is None:
-            # Use all available client directories, up to num_partitions
-            client_dirs = sorted([d for d in mapping_dir.iterdir() if d.is_dir()])
-            client_ids = [int(d.name) for d in client_dirs[:num_partitions]]
+            logger.error(f"No client IDs provided. Client IDs must be explicitly specified for FEMNIST partitioning.")
+            raise ValueError(
+                f"Client IDs must be explicitly provided when using FEMNISTByIDPartitioner. "
+                f"Please specify {num_partitions} client IDs in the configuration."
+            )
         else:
-            # Limit to num_partitions if needed
-            client_ids = client_ids[:num_partitions]
+            # Validate that the number of client IDs matches num_partitions
+            if len(client_ids) != num_partitions:
+                raise ValueError(
+                    f"Number of client IDs ({len(client_ids)}) doesn't match requested partitions ({num_partitions}). "
+                    f"Please provide exactly {num_partitions} client IDs."
+                )
         
         # Verify all client IDs exist
         for cid in client_ids:
@@ -626,6 +711,7 @@ class FEMNISTByIDPartitioner(DatasetPartitioner):
                 transform=transform
             )
             partitions.append(client_dataset)
+            logger.info(f"Client ID {cid} dataset size: {len(client_dataset)} samples")
         
         logger.info(f"Selected {len(partitions)} FEMNIST partitions by client ID from {self.partition_dir_name}")
         return partitions
@@ -633,8 +719,8 @@ class FEMNISTByIDPartitioner(DatasetPartitioner):
 
 class ShakespeareCharacterPartitioner(DatasetPartitioner):
     """
-    Partition Shakespeare dataset by character.
-    Each partition corresponds to a different character in the plays.
+    Use Shakespeare's natural partitioning by character.
+    Each partition corresponds to a different character.
     """
     def __init__(self, data_dir: Union[str, Path]):
         """
@@ -654,20 +740,28 @@ class ShakespeareCharacterPartitioner(DatasetPartitioner):
             num_partitions: Maximum number of partitions to create
             
         Returns:
-            A list of dataset partitions, one per character
+            A list of Shakespeare datasets, one per character
         """
-        # Implementation for Shakespeare dataset
-        # This is a placeholder - the actual implementation would depend on the structure
-        # of your Shakespeare dataset
-        logger.warning("Shakespeare character partitioning not fully implemented")
+        # This is a placeholder for the actual implementation
+        # In a real implementation, we would:
+        # 1. Load character mappings
+        # 2. Create subdatasets per character
+        logger.warning("ShakespeareCharacterPartitioner is a placeholder and not fully implemented")
         
-        # For now, just return IID partitions
-        iid_partitioner = IIDPartitioner()
-        return iid_partitioner.partition(dataset, num_partitions)
+        # For now, just return dummy partitions
+        partitions = []
+        for i in range(min(num_partitions, 5)):  # Assume 5 characters max for placeholder
+            # Create a subset with random indices (simplified placeholder)
+            indices = list(range(i, len(dataset), 5))
+            partition = Subset(dataset, indices)
+            partitions.append(partition)
+        
+        return partitions
 
 
-# Register partitioning strategies
+# Register partitioners with the registry
 PartitionerRegistry.register("default", "iid", IIDPartitioner)
+PartitionerRegistry.register("default", "seeded_iid", SeededIIDPartitioner)
 PartitionerRegistry.register("default", "dirichlet", DirichletPartitioner)
 PartitionerRegistry.register("default", "pathological", PathologicalPartitioner)
 PartitionerRegistry.register("femnist", "natural", FEMNISTNaturalPartitioner)
