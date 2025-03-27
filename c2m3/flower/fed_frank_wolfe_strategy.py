@@ -267,7 +267,8 @@ class FrankWolfeSync(Strategy):
             batch_size = int(config["batch_size"])
             num_workers = int(config["num_workers"])
             print(f'{props=}')
-            full_file: Path = props["partition"] / str(props["cid"])
+            # Convert string to Path object before using the / operator
+            full_file: Path = Path(props["partition"]) / str(props["cid"])
             dataset = load_femnist_dataset(
                 mapping=full_file,
                 name="train",

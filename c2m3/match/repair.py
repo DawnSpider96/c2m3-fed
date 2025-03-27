@@ -1,4 +1,5 @@
 import copy
+import logging
 from typing import Dict, List
 
 import torch
@@ -7,11 +8,12 @@ import torch.nn as nn
 from c2m3.models.repaired_resnet import RepairedResNet
 from c2m3.models.resnet import ResNet
 
-from c2m3.utils.utils import fuse_batch_norm_into_conv
+from c2m3.utils.utils import fuse_batch_norm_into_conv, l2_norm_models, get_model
 
+# Set up logger
+logger = logging.getLogger(__name__)
 
 def repair_model(model_to_repair, models, train_loader):
-
     model_to_repair = copy.deepcopy(model_to_repair)
 
     if torch.cuda.is_available():
@@ -22,12 +24,13 @@ def repair_model(model_to_repair, models, train_loader):
         wrapped_models = [make_tracked_net(model).cpu() for model in models.values()]
 
     for i, model in enumerate(wrapped_models):
-        train_loader = train_loader if not isinstance(train_loader, List) else train_loader[i + 1]
+        logger.info(f"Resetting BN stats for wrapped model {i}")
+        train_loader_i = train_loader if not isinstance(train_loader, List) else train_loader[i + 1]
         
         if torch.cuda.is_available():
-            reset_bn_stats(model.cuda(), loader=train_loader, epochs=1)
+            reset_bn_stats(model.cuda(), loader=train_loader_i, epochs=1)
         else:
-            reset_bn_stats(model.cpu(), loader=train_loader, epochs=1)
+            reset_bn_stats(model.cpu(), loader=train_loader_i, epochs=1)
 
     compute_goal_statistics(repaired_model, wrapped_models)
 
@@ -55,7 +58,6 @@ def repair_model(model_to_repair, models, train_loader):
 
         model_to_repair.model = repaired_model_correct_class
         model_to_repair.hparams["model"]["_target_"] = "ccmm.models.repaired_resnet.RepairedResNet"
-
         return model_to_repair
 
     return repaired_model

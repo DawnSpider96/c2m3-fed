@@ -349,6 +349,72 @@ class CNNPermutationSpecBuilder(PermutationSpecBuilder):
 
         return self.permutation_spec_from_axes_to_perm(axes_to_perm)
 
+class TinyResNetPermutationSpecBuilder(PermutationSpecBuilder):
+    def __init__(self) -> None:
+        super().__init__()
+
+    def create_permutation_spec(self, **kwargs) -> PermutationSpec:
+        """
+        Permutation spec for a small ResNet-like model:
+          conv1
+          layer1 (2 BasicBlocks)
+          layer2 (2 BasicBlocks, first block uses downsample)
+          layer3 (2 BasicBlocks, first block uses downsample)
+          fc
+        """
+        axes_to_perm = {
+            # First convolution
+            **conv_axes("conv1", p_rows="P_conv1", p_cols=None, bias=True),
+
+            # ---------------- LAYER 1 ----------------
+            # layer1[0].conv1
+            **conv_axes("layer1.0.conv1", p_rows="P_layer1_0_c1", p_cols="P_conv1", bias=True),
+            # layer1[0].conv2
+            **conv_axes("layer1.0.conv2", p_rows="P_layer1_0_c2", p_cols="P_layer1_0_c1", bias=True),
+            # no downsample if stride=1 and in_channels == out_channels
+
+            # layer1[1].conv1
+            **conv_axes("layer1.1.conv1", p_rows="P_layer1_1_c1", p_cols="P_layer1_0_c2", bias=True),
+            # layer1[1].conv2
+            **conv_axes("layer1.1.conv2", p_rows="P_layer1_1_c2", p_cols="P_layer1_1_c1", bias=True),
+            # no downsample
+
+            # ---------------- LAYER 2 ----------------
+            # layer2[0].conv1
+            **conv_axes("layer2.0.conv1", p_rows="P_layer2_0_c1", p_cols="P_layer1_1_c2", bias=True),
+            # layer2[0].conv2
+            **conv_axes("layer2.0.conv2", p_rows="P_layer2_0_c2", p_cols="P_layer2_0_c1", bias=True),
+            # downsample.0 is a Conv2d, triggered by stride=2
+            **conv_axes("layer2.0.downsample.0", p_rows="P_layer2_0_ds", p_cols="P_layer1_1_c2", bias=True),
+
+            # layer2[1].conv1
+            **conv_axes("layer2.1.conv1", p_rows="P_layer2_1_c1", p_cols="P_layer2_0_c2", bias=True),
+            # layer2[1].conv2
+            **conv_axes("layer2.1.conv2", p_rows="P_layer2_1_c2", p_cols="P_layer2_1_c1", bias=True),
+            # no downsample if stride=1
+
+            # ---------------- LAYER 3 ----------------
+            # layer3[0].conv1
+            **conv_axes("layer3.0.conv1", p_rows="P_layer3_0_c1", p_cols="P_layer2_1_c2", bias=True),
+            # layer3[0].conv2
+            **conv_axes("layer3.0.conv2", p_rows="P_layer3_0_c2", p_cols="P_layer3_0_c1", bias=True),
+            # downsample.0 (stride=2)
+            **conv_axes("layer3.0.downsample.0", p_rows="P_layer3_0_ds", p_cols="P_layer2_1_c2", bias=True),
+
+            # layer3[1].conv1
+            **conv_axes("layer3.1.conv1", p_rows="P_layer3_1_c1", p_cols="P_layer3_0_c2", bias=True),
+            # layer3[1].conv2
+            **conv_axes("layer3.1.conv2", p_rows="P_layer3_1_c2", p_cols="P_layer3_1_c1", bias=True),
+            # no downsample if stride=1
+
+            # Final FC layer (dense)
+            **dense_layer_axes("fc", p_rows=None, p_cols="P_layer3_1_c2"),
+        }
+
+        # Build the PermutationSpec object
+        return self.permutation_spec_from_axes_to_perm(axes_to_perm)
+
+
 
 class AutoPermutationSpecBuilder(PermutationSpecBuilder):
     def create_permutation_spec(self, ref_model, ref_input, **kwargs) -> list:

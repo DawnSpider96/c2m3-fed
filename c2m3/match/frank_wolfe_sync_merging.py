@@ -21,7 +21,6 @@ def frank_wolfe_synchronized_merging(models: List[MyLightningModule], train_load
     model_orig_weights = {symbol: copy.deepcopy(model.model.state_dict()) for symbol, model in symbols_to_models.items()}
 
     permutation_spec_builder = CNNPermutationSpecBuilder()
-    # Argument actually unnecessary
     permutation_spec = permutation_spec_builder.create_permutation_spec(ref_model=ref_model)
 
     restore_original_weights(symbols_to_models, model_orig_weights)

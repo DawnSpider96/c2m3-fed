@@ -759,6 +759,434 @@ class ShakespeareCharacterPartitioner(DatasetPartitioner):
         return partitions
 
 
+class FEMNISTPathologicalPartitioner(DatasetPartitioner):
+    """
+    Pathological non-IID partitioning for FEMNIST dataset where each client gets data from exactly one class.
+    
+    This partitioner ensures:
+    1. Each partition contains samples from exactly one class
+    2. Classes with fewer than samples_per_partition samples are ignored
+    3. If there aren't enough classes with sufficient samples, an error is raised
+    """
+    def __init__(self, data_dir: Union[str, Path], seed: int, samples_per_partition: int):
+        """
+        Initialize the FEMNIST pathological partitioner.
+        
+        Args:
+            data_dir: Directory containing the FEMNIST dataset
+            seed: Random seed for reproducibility
+            samples_per_partition: Number of samples each partition should have
+        """
+        self.data_dir = Path(data_dir) if isinstance(data_dir, str) else data_dir
+        self.random_generator = random.Random(seed)
+        self.seed = seed
+        self.samples_per_partition = samples_per_partition
+    
+    def partition(self, training_samples: List[Tuple[str, int]], num_partitions: int) -> List[Dataset]:
+        """
+        Create pathological partitions for FEMNIST training data where each partition has samples from exactly one class.
+        
+        Args:
+            training_samples: List of (sample_path, label) tuples for training
+            num_partitions: Number of partitions to create
+            
+        Returns:
+            A list of FEMNIST datasets, one per partition
+        """
+        # Group samples by class label
+        samples_by_class = {}
+        for sample_path, label in training_samples:
+            if label not in samples_by_class:
+                samples_by_class[label] = []
+            samples_by_class[label].append((sample_path, label))
+        
+        # Sort classes by number of samples (descending) to prioritize classes with more samples
+        sorted_classes = sorted(samples_by_class.items(), key=lambda x: len(x[1]), reverse=True)
+        
+        # Create partitions, trying to use as few classes as possible
+        partitions = []
+        remaining_partitions = num_partitions
+        
+        # First, try to create partitions with single classes where possible
+        for class_label, class_samples in sorted_classes:
+            # Skip if we've created all needed partitions
+            if remaining_partitions <= 0:
+                break
+                
+            # Shuffle samples for this class
+            self.random_generator.shuffle(class_samples)
+            
+            # Calculate how many full partitions we can create from this class
+            num_full_partitions = len(class_samples) // self.samples_per_partition
+            num_full_partitions = min(num_full_partitions, remaining_partitions)
+            
+            # Create as many full partitions as possible from this class
+            for i in range(num_full_partitions):
+                start_idx = i * self.samples_per_partition
+                end_idx = start_idx + self.samples_per_partition
+                partition_samples = class_samples[start_idx:end_idx]
+                
+                # Create a FEMNIST dataset from these samples
+                from c2m3.experiments.corrected_partition_data import FEMNISTFromSamples
+                partition = FEMNISTFromSamples(
+                    samples=partition_samples,
+                    data_dir=self.data_dir / "femnist" / "data",
+                    name="train"
+                )
+                
+                partitions.append(partition)
+                remaining_partitions -= 1
+        
+        # If we still need more partitions, create mixed-class partitions
+        if remaining_partitions > 0:
+            # Collect all remaining samples
+            remaining_samples = []
+            for _, class_samples in samples_by_class.items():
+                # Calculate how many samples were already used
+                used_count = 0
+                for class_label, samples in sorted_classes:
+                    full_partitions = len(samples) // self.samples_per_partition
+                    used_count += full_partitions * self.samples_per_partition
+                
+                # Add remaining samples
+                if used_count < len(class_samples):
+                    remaining_samples.extend(class_samples[used_count:])
+            
+            # Shuffle remaining samples
+            self.random_generator.shuffle(remaining_samples)
+            
+            # Create remaining partitions
+            for i in range(remaining_partitions):
+                start_idx = i * self.samples_per_partition
+                end_idx = min(start_idx + self.samples_per_partition, len(remaining_samples))
+                
+                # If we don't have enough samples, use what we have
+                partition_samples = remaining_samples[start_idx:end_idx]
+                
+                # Create a FEMNIST dataset from these samples
+                from c2m3.experiments.corrected_partition_data import FEMNISTFromSamples
+                partition = FEMNISTFromSamples(
+                    samples=partition_samples,
+                    data_dir=self.data_dir / "femnist" / "data",
+                    name="train"
+                )
+                
+                partitions.append(partition)
+                
+                # Break if we run out of samples
+                if end_idx >= len(remaining_samples):
+                    break
+        
+        # Log information about created partitions
+        single_class_count = sum(1 for class_label, _ in sorted_classes if len(samples_by_class[class_label]) >= self.samples_per_partition)
+        logger.info(f"Created {len(partitions)} pathological FEMNIST partitions")
+        logger.info(f"Created {single_class_count} single-class partitions and {len(partitions) - single_class_count} mixed-class partitions")
+        logger.info(f"Each partition has up to {self.samples_per_partition} samples")
+        
+        return partitions
+
+
+class FEMNISTLDAPartitioner(DatasetPartitioner):
+    """
+    Non-IID partitioning for FEMNIST using Latent Dirichlet Allocation (LDA).
+    
+    This creates heterogeneous partitions where each client has a different distribution
+    of classes according to samples drawn from a Dirichlet distribution.
+    The concentration parameter alpha controls the degree of heterogeneity:
+    - Small alpha: Each client has samples from only a few classes (high heterogeneity)
+    - Large alpha: Class distribution is more uniform across clients (low heterogeneity)
+    """
+    def __init__(self, data_dir: Union[str, Path], seed: int, alpha: float = 0.5, samples_per_partition: Optional[int] = None):
+        """
+        Initialize the FEMNIST LDA partitioner.
+        
+        Args:
+            data_dir: Directory containing the FEMNIST dataset
+            seed: Random seed for reproducibility
+            alpha: Concentration parameter for Dirichlet distribution.
+                  Lower values create more heterogeneous partitions.
+            samples_per_partition: If provided, each partition will have exactly this many samples.
+                                 If None, partitions will be of variable size based on class distributions.
+        """
+        self.data_dir = Path(data_dir) if isinstance(data_dir, str) else data_dir
+        self.alpha = alpha
+        self.seed = seed
+        self.samples_per_partition = samples_per_partition
+        # Set numpy random seed
+        np.random.seed(seed)
+        self.random_generator = random.Random(seed)
+    
+    def partition(self, training_samples: List[Tuple[str, int]], num_partitions: int) -> List[Dataset]:
+        """
+        Create partitions for FEMNIST training data using Dirichlet distribution.
+        
+        Args:
+            training_samples: List of (sample_path, label) tuples for training
+            num_partitions: Number of partitions to create
+            
+        Returns:
+            A list of FEMNIST datasets, one per partition
+        """
+        # Group samples by class label
+        samples_by_class = {}
+        for sample_path, label in training_samples:
+            if label not in samples_by_class:
+                samples_by_class[label] = []
+            samples_by_class[label].append((sample_path, label))
+        
+        num_classes = len(samples_by_class)
+        logger.info(f"FEMNIST dataset has {num_classes} classes")
+        
+        # Generate Dirichlet distribution for each class
+        # This determines what fraction of each class goes to each partition
+        class_proportions = np.zeros((num_classes, num_partitions))
+        for k in range(num_classes):
+            proportions = np.random.dirichlet(np.repeat(self.alpha, num_partitions))
+            class_proportions[k] = proportions
+        
+        # Calculate how many samples of each class go to each partition
+        class_assignments = {}
+        for i, (label, samples) in enumerate(samples_by_class.items()):
+            # Shuffle samples for this class
+            shuffled_samples = list(samples)
+            self.random_generator.shuffle(shuffled_samples)
+            
+            # Determine how many samples of this class go to each partition
+            num_samples = len(shuffled_samples)
+            proportions = class_proportions[i]
+            assignments = (proportions * num_samples).astype(int)
+            
+            # Make sure all samples are assigned by adjusting the largest partition
+            if sum(assignments) < num_samples:
+                largest_idx = np.argmax(assignments)
+                assignments[largest_idx] += num_samples - sum(assignments)
+            
+            # Store assignments for this class
+            class_assignments[label] = {
+                'samples': shuffled_samples,
+                'assignments': assignments
+            }
+        
+        # Create partitions based on class assignments
+        partition_samples = [[] for _ in range(num_partitions)]
+        
+        # Distribute samples according to assignments
+        for label, data in class_assignments.items():
+            samples = data['samples']
+            assignments = data['assignments']
+            
+            start_idx = 0
+            for p_idx, count in enumerate(assignments):
+                if count > 0:
+                    end_idx = start_idx + count
+                    partition_samples[p_idx].extend(samples[start_idx:end_idx])
+                    start_idx = end_idx
+        
+        # Create datasets from partition samples
+        partitions = []
+        from c2m3.experiments.corrected_partition_data import FEMNISTFromSamples
+        
+        # If samples_per_partition is specified, adjust the partition sizes
+        if self.samples_per_partition is not None:
+            # Shuffle all samples again to maintain the Dirichlet distribution for classes,
+            # but limit each partition to exactly samples_per_partition
+            for i in range(len(partition_samples)):
+                self.random_generator.shuffle(partition_samples[i])
+                if len(partition_samples[i]) > self.samples_per_partition:
+                    # Trim to exact size if too many samples
+                    partition_samples[i] = partition_samples[i][:self.samples_per_partition]
+                elif len(partition_samples[i]) < self.samples_per_partition:
+                    logger.warning(
+                        f"Partition {i} has only {len(partition_samples[i])} samples, "
+                        f"less than requested {self.samples_per_partition}. "
+                        f"Using all available samples for this partition."
+                    )
+        
+        for i, samples in enumerate(partition_samples):
+            if not samples:
+                logger.warning(f"Partition {i} has no samples, skipping")
+                continue
+                
+            # Create a FEMNIST dataset from these samples
+            partition = FEMNISTFromSamples(
+                samples=samples,
+                data_dir=self.data_dir / "femnist" / "data",
+                name="train"
+            )
+            
+            partitions.append(partition)
+            
+            # Log class distribution for this partition
+            class_counts = {}
+            for _, label in samples:
+                class_counts[label] = class_counts.get(label, 0) + 1
+            
+            # Convert to percentages
+            total = sum(class_counts.values())
+            class_percents = {label: 100 * count / total for label, count in class_counts.items()}
+            logger.debug(f"Partition {i} has {len(samples)} samples with class distribution: {class_percents}")
+        
+        if self.samples_per_partition is not None:
+            logger.info(f"Created {len(partitions)} LDA-based FEMNIST partitions with alpha={self.alpha} and approximately {self.samples_per_partition} samples per partition")
+        else:
+            logger.info(f"Created {len(partitions)} LDA-based FEMNIST partitions with alpha={self.alpha}")
+        return partitions
+
+
+class FEMNISTHeldOutClassPartitioner(DatasetPartitioner):
+    """
+    Special non-IID partitioning for FEMNIST where:
+    1. One class is selected to be the "held out" class
+    2. N-1 partitions receive IID samples from all classes EXCEPT the held out class
+    3. The Nth partition gets all samples from the held out class, plus additional IID samples if needed
+    
+    This creates a scenario where most models never see a particular class during training,
+    while one model specializes in that class.
+    """
+    def __init__(self, data_dir: Union[str, Path], seed: int, samples_per_partition: Optional[int] = None):
+        """
+        Initialize the FEMNIST held-out class partitioner.
+        
+        Args:
+            data_dir: Directory containing the FEMNIST dataset
+            seed: Random seed for reproducibility
+            samples_per_partition: Optional fixed number of samples per partition.
+                                 If None, partitions will be of approximately equal size.
+        """
+        self.data_dir = Path(data_dir) if isinstance(data_dir, str) else data_dir
+        self.random_generator = random.Random(seed)
+        self.seed = seed
+        self.samples_per_partition = samples_per_partition
+    
+    def partition(self, training_samples: List[Tuple[str, int]], num_partitions: int) -> List[Dataset]:
+        """
+        Create partitions where N-1 partitions have no samples from one class,
+        and the Nth partition has all samples from that class.
+        
+        Args:
+            training_samples: List of (sample_path, label) tuples for training
+            num_partitions: Number of partitions to create
+            
+        Returns:
+            A list of FEMNIST datasets, one per partition
+        """
+        if num_partitions < 2:
+            raise ValueError("Need at least 2 partitions for held-out class partitioning")
+        
+        # Group samples by class label
+        samples_by_class = {}
+        for sample_path, label in training_samples:
+            if label not in samples_by_class:
+                samples_by_class[label] = []
+            samples_by_class[label].append((sample_path, label))
+        
+        # Get all unique classes
+        all_classes = list(samples_by_class.keys())
+        num_classes = len(all_classes)
+        
+        # Randomly select one class to be held out
+        self.random_generator.shuffle(all_classes)
+        held_out_class = all_classes[0]
+        logger.info(f"Selected class {held_out_class} as the held-out class")
+        
+        # Get samples for the held-out class
+        held_out_samples = samples_by_class[held_out_class]
+        remaining_samples = []
+        for cls, samples in samples_by_class.items():
+            if cls != held_out_class:
+                remaining_samples.extend(samples)
+        
+        # Shuffle the remaining samples for IID distribution
+        self.random_generator.shuffle(remaining_samples)
+        
+        # Determine how many samples to assign to each non-specialist partition
+        if self.samples_per_partition is not None:
+            # Fixed size partitioning
+            samples_per_regular_partition = self.samples_per_partition
+            total_regular_samples_needed = samples_per_regular_partition * (num_partitions - 1)
+            
+            # Check if we have enough samples
+            if total_regular_samples_needed > len(remaining_samples):
+                logger.warning(
+                    f"Not enough samples for {num_partitions-1} regular partitions with {samples_per_regular_partition} samples each. "
+                    f"Need {total_regular_samples_needed}, but only have {len(remaining_samples)}. Will adjust partition sizes."
+                )
+                samples_per_regular_partition = len(remaining_samples) // (num_partitions - 1)
+        else:
+            # Divide remaining samples approximately equally among N-1 partitions
+            samples_per_regular_partition = len(remaining_samples) // (num_partitions - 1)
+        
+        # Create the N-1 regular partitions (without the held-out class)
+        regular_partitions = []
+        
+        for i in range(num_partitions - 1):
+            start_idx = i * samples_per_regular_partition
+            end_idx = start_idx + samples_per_regular_partition
+            
+            # Make sure we don't go beyond available samples
+            if end_idx <= len(remaining_samples):
+                partition_samples = remaining_samples[start_idx:end_idx]
+                
+                # Create dataset
+                from c2m3.experiments.corrected_partition_data import FEMNISTFromSamples
+                partition = FEMNISTFromSamples(
+                    samples=partition_samples,
+                    data_dir=self.data_dir / "femnist" / "data",
+                    name="train"
+                )
+                
+                regular_partitions.append(partition)
+        
+        # Create the specialist partition with all held-out class samples
+        specialist_samples = list(held_out_samples)  # Start with all held-out class samples
+        
+        # If self.samples_per_partition is specified and greater than the number of held-out samples,
+        # add additional samples from other classes
+        if self.samples_per_partition is not None and len(specialist_samples) < self.samples_per_partition:
+            # Calculate how many additional samples we need
+            additional_needed = self.samples_per_partition - len(specialist_samples)
+            
+            # Use samples that weren't assigned to regular partitions
+            remaining_idx = (num_partitions - 1) * samples_per_regular_partition
+            additional_samples = remaining_samples[remaining_idx:remaining_idx + additional_needed]
+            
+            # If we still need more, cycle through the remaining samples
+            if len(additional_samples) < additional_needed:
+                # Calculate how many more we need
+                more_needed = additional_needed - len(additional_samples)
+                
+                # Create a cycle of samples
+                cycle_start = 0
+                while len(additional_samples) < additional_needed and cycle_start < remaining_idx:
+                    cycle_end = min(cycle_start + more_needed, remaining_idx)
+                    additional_samples.extend(remaining_samples[cycle_start:cycle_end])
+                    cycle_start = cycle_end
+                
+                # Limit to what we actually need
+                additional_samples = additional_samples[:additional_needed]
+            
+            specialist_samples.extend(additional_samples)
+        
+        # Create the specialist partition dataset
+        from c2m3.experiments.corrected_partition_data import FEMNISTFromSamples
+        specialist_partition = FEMNISTFromSamples(
+            samples=specialist_samples,
+            data_dir=self.data_dir / "femnist" / "data",
+            name="train"
+        )
+        
+        # Combine all partitions
+        partitions = regular_partitions + [specialist_partition]
+        
+        # Log information
+        logger.info(f"Created {len(regular_partitions)} regular partitions with ~{samples_per_regular_partition} samples each")
+        logger.info(f"Created 1 specialist partition with {len(specialist_samples)} samples "
+                    f"({len(held_out_samples)} from held-out class {held_out_class}, "
+                    f"{len(specialist_samples)-len(held_out_samples)} from other classes)")
+        
+        return partitions
+
+
 # Register partitioners with the registry
 PartitionerRegistry.register("default", "iid", IIDPartitioner)
 PartitionerRegistry.register("default", "seeded_iid", SeededIIDPartitioner)
@@ -767,4 +1195,8 @@ PartitionerRegistry.register("default", "pathological", PathologicalPartitioner)
 PartitionerRegistry.register("femnist", "natural", FEMNISTNaturalPartitioner)
 PartitionerRegistry.register("femnist", "iid", FEMNISTIIDPartitioner)
 PartitionerRegistry.register("femnist", "by_id", FEMNISTByIDPartitioner)
-PartitionerRegistry.register("shakespeare", "natural", ShakespeareCharacterPartitioner) 
+PartitionerRegistry.register("shakespeare", "natural", ShakespeareCharacterPartitioner)
+PartitionerRegistry.register("femnist", "pathological", FEMNISTPathologicalPartitioner)
+PartitionerRegistry.register("femnist", "lda", FEMNISTLDAPartitioner)
+PartitionerRegistry.register("femnist", "dirichlet", FEMNISTLDAPartitioner)  # Register as an alias
+PartitionerRegistry.register("femnist", "held_out_class", FEMNISTHeldOutClassPartitioner) 

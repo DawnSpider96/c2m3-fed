@@ -24,6 +24,8 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm import tqdm
 
+from c2m3.models.tiny_resnet import BasicBlock, TinyResNet
+
 from .femnist_dataset import FEMNIST
 from flwr.common.logger import log
 from c2m3.models.cnn import Net
@@ -121,6 +123,73 @@ def load_femnist_dataset(data_dir: Path, mapping: Path, name: str) -> FEMNIST:
         data_dir=data_dir,
         transform=transform,
         target_transform=to_tensor_transform,
+    )
+
+
+class CIFAR10FromSamples(Dataset):
+    """CIFAR10 dataset from samples.
+    
+    Parameters
+    ----------
+        samples (list): List of (image_path, label) tuples
+        data_dir (Path): Base directory for image paths
+        transform (callable, optional): Transform to apply to images
+    """
+    def __init__(self, samples, data_dir, transform=None):
+        self.samples = samples
+        self.data_dir = data_dir
+        self.transform = transform
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        img_path, label = self.samples[idx]
+        # Load image as PIL
+        from PIL import Image
+        img = Image.open(self.data_dir / img_path).convert('RGB')
+        
+        if self.transform:
+            img = self.transform(img)
+        
+        return img, label
+
+
+def load_cifar10_dataset(data_dir: Path, mapping: Path, name: str) -> CIFAR10FromSamples:
+    """Load the CIFAR10 dataset given the mapping file.
+
+    The relevant transforms are automatically applied.
+
+    Parameters
+    ----------
+        data_dir (Path): path to the dataset folder.
+        mapping (Path): path to the mapping file chosen.
+        name (str): name of the dataset to load, train or test.
+
+    Returns
+    -------
+        Dataset: CIFAR10FromSamples dataset object, ready-to-use.
+    """
+    # For CIFAR10, use standard normalization
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+
+    # Load samples from the mapping file
+    with open(mapping, "r") as f:
+        mapping_data = json.load(f)
+    
+    if name not in mapping_data:
+        raise ValueError(f"'{name}' data not found in mapping file")
+    
+    # Get samples for this name (train or test)
+    samples = mapping_data[name]
+    
+    return CIFAR10FromSamples(
+        samples=samples,
+        data_dir=data_dir,
+        transform=transform
     )
 
 
@@ -301,6 +370,39 @@ def get_network_generator_cnn_random() -> Callable[[], Net]:
         return Net()
 
     return generated_net
+
+def get_network_generator_tiny_resnet(num_classes=10):
+    """
+    Create a generator function that returns a TinyResNet model configured for CIFAR10.
+    
+    Args:
+        input_channels (int): Number of input channels (3 for RGB images)
+        num_classes (int): Number of output classes (10 for CIFAR10)
+        
+    Returns:
+        Callable that returns a TinyResNet model
+    """
+    untrained_net: TinyResNet = TinyResNet(
+            block=BasicBlock, 
+            num_classes=num_classes, 
+            norm_layer=nn.BatchNorm2d
+        )
+
+    def network_generator() -> TinyResNet:
+        return deepcopy(untrained_net)
+    
+    return network_generator
+
+def get_network_generator_tiny_resnet_random() -> Callable[[], TinyResNet]:
+    """Get function to generate a new TinyResNet model with random initialization."""
+    def network_generator() -> TinyResNet:
+        return TinyResNet(
+            block=BasicBlock,
+            num_classes=10,
+            norm_layer=nn.BatchNorm2d
+        )
+
+    return network_generator
 
 
 # All experiments will have the exact same initialization.

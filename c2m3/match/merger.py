@@ -65,7 +65,6 @@ class FrankWolfeSynchronizedMerger(Merger):
         self.device = device
 
     def __call__(self, models, train_loader: Optional[DataLoader] = None):
-
         merged_model, models_permuted_to_universe = self.merge_models(models)
 
         repaired_model = repair_model(merged_model, models_permuted_to_universe, train_loader)
@@ -74,21 +73,22 @@ class FrankWolfeSynchronizedMerger(Merger):
 
     @timeit
     def merge_models(self, models):
-
         models = {symbol: model.to(self.device) for symbol, model in models.items()}
 
         symbols = list(models.keys())
 
         models_permuted_to_universe = {symbol: copy.deepcopy(model) for symbol, model in models.items()}
 
+        # Reference model (first model)
         merged_model = copy.deepcopy(models[symbols[0]])
 
+        # Get model parameters for all models
         params = {symbol: copy.deepcopy(get_model(model).state_dict()) for symbol, model in models.items()}
 
         combinations = get_all_symbols_combinations(symbols)
         canonical_combinations = [(source, target) for (source, target) in combinations if source < target]  # NOQA
         
-        perm_indices, _ = frank_wolfe_synchronized_matching(
+        perm_indices, opt_infos = frank_wolfe_synchronized_matching(
             params=params,
             perm_spec=self.permutation_spec,
             symbols=symbols,
@@ -98,6 +98,8 @@ class FrankWolfeSynchronizedMerger(Merger):
             keep_soft_perms=self.keep_soft_perms,
             score_tolerance=self.score_tolerance,
         )
+
+        pylogger.info(f'{perm_indices=}')
 
         for symbol in symbols:
             perms_to_apply = {}
@@ -113,7 +115,6 @@ class FrankWolfeSynchronizedMerger(Merger):
                     perm_to_apply = perm_matrix_to_perm_indices(perm)
 
                 perms_to_apply[perm_name] = perm_to_apply
-            print(f'{perms_to_apply=}')
 
             updated_params = apply_permutation_to_statedict(
                 self.permutation_spec, perms_to_apply, get_model(models[symbol]).state_dict()
