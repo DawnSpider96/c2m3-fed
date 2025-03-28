@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset, Subset, ConcatDataset
 import matplotlib.pyplot as plt
 import seaborn as sns
 from torchvision import datasets, transforms
@@ -21,14 +21,12 @@ import pandas as pd
 from c2m3.match.merger import FrankWolfeSynchronizedMerger
 from c2m3.match.permutation_spec import (
     CNNPermutationSpecBuilder,
-    AutoPermutationSpecBuilder
+    TinyResNetPermutationSpecBuilder
 )
 from c2m3.models.utils import get_model_class
 from c2m3.modules.pl_module import MyLightningModule
 from c2m3.utils.utils import set_seed
-from c2m3.match.ties_merging import merge_models_ties
 from flwr.server.strategy.aggregate import aggregate as flwr_aggregate
-from c2m3.data.partitioners import PartitionerRegistry, DatasetPartitioner
 from c2m3.common.client_utils import (
     load_femnist_dataset, 
     get_network_generator_cnn,
@@ -47,7 +45,6 @@ from c2m3.common.client_utils import (
 )
 
 from c2m3.experiments.corrected_partition_data import partition_data as corrected_partition_data
-from c2m3.experiments.corrected_partition_data import FEMNISTFromSamples
 
 # Setup logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -81,14 +78,14 @@ class MergeExperimentConfig:
     data_distribution: str = "iid"  # 'iid', 'dirichlet', 'pathological', 'natural'
     non_iid_alpha: float = 5.0  # Dirichlet alpha parameter for non-IID distribution
     classes_per_partition: int = 1  # For pathological partitioning, how many classes per client
-    samples_per_partition: Optional[int] = 4000  # Number of samples per partition (for IID FEMNIST), None for equal division
+    samples_per_partition: Union[int, List[int], None] = 4000  # Number of samples per partition (for IID FEMNIST), None for equal division
     
     # Initialization
     initialization_type: str = "identical"  # 'identical' or 'random'
     
     # Merging configuration
     merging_methods: List[str] = None  # ['c2m3', 'fedavg', 'ties', 'median']
-    c2m3_max_iter: int = 300  # Max iterations for Frank-Wolfe
+    c2m3_max_iter: int = 1000  # Max iterations for Frank-Wolfe
     c2m3_score_tolerance: float = 1e-6  # Convergence threshold for Frank-Wolfe
     c2m3_init_method: str = "identity"  # Initialization method for permutation matrices
     ties_alpha: float = 0.5  # Interpolation parameter for TIES merging
@@ -109,6 +106,10 @@ class MergeExperimentConfig:
         # Convert epochs_per_model to list if it's an int
         if isinstance(self.epochs_per_model, int):
             self.epochs_per_model = [self.epochs_per_model] * self.num_models
+            
+        # Convert samples_per_partition to list if it's an int
+        if isinstance(self.samples_per_partition, int):
+            self.samples_per_partition = [self.samples_per_partition] * self.num_models
 
 class ModelTrainer:
     """Class for training individual models"""
@@ -154,21 +155,18 @@ class ModelTrainer:
     def train_epoch(self):
         """Train for one epoch"""
         if self.dataset_name == "femnist":
-            # Make sure model is in training mode
             self.model.train()
             
-            # Use the FEMNIST-specific training function
             epoch_loss = train_femnist(
                 net=self.model,
                 train_loader=self.train_loader,
-                epochs=1,  # Just one epoch at a time
+                epochs=1,
                 device=self.device,
                 optimizer=self.optimizer,
                 criterion=self.criterion,
-                max_batches=None  # Use all batches
+                max_batches=None 
             )
             
-            # Since train_femnist doesn't return accuracy, we need to evaluate to get it
             self.model.eval()
             correct = 0
             total = 0
@@ -187,43 +185,7 @@ class ModelTrainer:
                 epoch_acc = 0.0
             else:
                 epoch_acc = correct / total
-        elif self.dataset_name == "cifar10":
-            # Use the CIFAR10-specific training approach
-            self.model.train()
-            total_loss = 0
-            correct = 0
-            total = 0
-            
-            for inputs, targets in self.train_loader:
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                
-                # Zero gradients
-                self.optimizer.zero_grad()
-                
-                # Forward pass
-                outputs = self.model(inputs)
-                loss = self.criterion(outputs, targets)
-                
-                # Backward pass and optimize
-                loss.backward()
-                self.optimizer.step()
-                
-                # Track metrics
-                total_loss += loss.item() * inputs.size(0)
-                _, predicted = outputs.max(1)
-                total += targets.size(0)
-                correct += predicted.eq(targets).sum().item()
-            
-            # Compute epoch metrics
-            if total == 0 or len(self.train_loader.dataset) == 0:
-                logger.warning(f"Empty CIFAR10 dataset detected during training. Setting loss and accuracy to 0.")
-                epoch_loss = 0.0
-                epoch_acc = 0.0
-            else:
-                epoch_loss = total_loss / len(self.train_loader.dataset)
-                epoch_acc = correct / total
-                
-            logger.info(f"CIFAR10 training in progress - Loss: {epoch_loss:.4f}, Acc: {epoch_acc:.4f}")
+        # elif self.dataset_name == "cifar10":
         else:
             raise ValueError(f"Unsupported dataset: {self.dataset_name}. Only 'femnist' and 'cifar10' are supported.")
             
@@ -246,22 +208,17 @@ class ModelTrainer:
         
         # Calculate balanced accuracy
         try:
-            # Get unique classes in the ground truth
             unique_classes = np.unique(targets_np)
             
-            # Create a mask for predictions that match classes in ground truth
             valid_indices = np.isin(preds_np, unique_classes)
             
-            # If we have no valid predictions, return 0
             if not np.any(valid_indices):
                 logger.warning("No valid predictions found (all predicted classes missing from ground truth)")
                 return 0.0
                 
-            # Filter predictions and targets to only include valid indices
             filtered_preds = preds_np[valid_indices]
             filtered_targets = targets_np[valid_indices]
             
-            # Calculate balanced accuracy on filtered data
             balanced_acc = balanced_accuracy_score(filtered_targets, filtered_preds)
             return balanced_acc
         except Exception as e:
@@ -289,17 +246,14 @@ class ModelTrainer:
                 outputs = self.model(inputs)
                 loss = self.criterion(outputs, targets)
                 
-                # Track metrics
                 total_loss += loss.item() * inputs.size(0)
                 _, predicted = outputs.max(1)
                 total += targets.size(0)
                 correct += predicted.eq(targets).sum().item()
                 
-                # Save predictions and targets for balanced accuracy
                 all_predictions.append(predicted)
                 all_targets.append(targets)
         
-        # Compute metrics
         if total == 0 or len(self.val_loader.dataset) == 0:
             logger.warning(f"Empty validation dataset detected. Setting metrics to 0.")
             val_loss = 0.0
@@ -309,7 +263,6 @@ class ModelTrainer:
             val_loss = total_loss / len(self.val_loader.dataset)
             val_acc = correct / total
             
-            # Calculate balanced accuracy
             if self.has_sklearn and all_predictions and all_targets:
                 all_predictions = torch.cat(all_predictions)
                 all_targets = torch.cat(all_targets)
@@ -322,48 +275,16 @@ class ModelTrainer:
     def evaluate(self):
         """Evaluate model on test set"""
         if self.dataset_name == "femnist":
-            # Use the FEMNIST-specific testing function
-            test_loss, test_acc = test_femnist(
+            return test_femnist(
                 net=self.model,
                 test_loader=self.test_loader,
                 device=self.device,
                 criterion=self.criterion,
                 max_batches=None  # Use all batches
             )
-        elif self.dataset_name == "cifar10":
-            # Use CIFAR10-specific testing approach
-            self.model.eval()
-            total_loss = 0
-            correct = 0
-            total = 0
-            
-            with torch.no_grad():
-                for inputs, targets in self.test_loader:
-                    inputs, targets = inputs.to(self.device), targets.to(self.device)
-                    
-                    # Forward pass
-                    outputs = self.model(inputs)
-                    loss = self.criterion(outputs, targets)
-                    
-                    # Track metrics
-                    total_loss += loss.item() * inputs.size(0)
-                    _, predicted = outputs.max(1)
-                    total += targets.size(0)
-                    correct += predicted.eq(targets).sum().item()
-            
-            # Compute metrics for CIFAR10
-            if total == 0 or len(self.test_loader.dataset) == 0:
-                logger.warning(f"Empty CIFAR10 test dataset detected. Setting loss and accuracy to 0.")
-                test_loss = 0.0
-                test_acc = 0.0
-            else:
-                test_loss = total_loss / len(self.test_loader.dataset)
-                test_acc = correct / total
-                logger.info(f"CIFAR10 test accuracy: {test_acc:.4f}")
+        # elif self.dataset_name == "cifar10":
         else:
             raise ValueError(f"Unsupported dataset: {self.dataset_name}. Only 'femnist' and 'cifar10' are supported.")
-        
-        return test_loss, test_acc
     
     def should_stop_early(self, val_metric):
         """Check if training should be stopped early based on validation metric"""
@@ -392,10 +313,10 @@ class ModelTrainer:
                 self.val_accuracies.append(val_acc)
                 self.val_balanced_accuracies.append(val_balanced_acc)
                 
-                # Determine early stopping metric
-                val_metric = val_balanced_acc  # Use balanced accuracy
+                # Balanced accuracy is early stopping metric
+                val_metric = val_balanced_acc
                 
-                # Save the best model so far
+                # Save best model 
                 if val_metric > self.best_val_metric:
                     best_model_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
             else:
@@ -416,20 +337,16 @@ class ModelTrainer:
                 logger.info(f"Early stopping triggered at epoch {epoch+1}. Best validation balanced accuracy: {self.best_val_metric:.4f}")
                 break
         
-        # Restore best model if we did early stopping and have a best model
         if early_stopped and best_model_state is not None:
             self.model.load_state_dict(best_model_state)
             logger.info("Restored model to best validation performance")
             
-            # Re-evaluate best model on validation
             if self.val_loader:
                 val_loss, val_acc, val_balanced_acc = self.evaluate_validation()
         
-        # Only evaluate on test set at the end of training
         test_loss, test_acc = self.evaluate()
         logger.info(f"Final test performance - Loss: {test_loss:.4f}, Acc: {test_acc:.4f}")
         
-        # Prepare return dictionary with training history
         history = {
             'train_losses': self.train_losses,
             'train_accuracies': self.train_accuracies,
@@ -441,7 +358,6 @@ class ModelTrainer:
             'early_stopped': early_stopped
         }
         
-        # Add validation metrics if available
         if self.val_loader:
             history.update({
                 'val_losses': self.val_losses,
@@ -463,42 +379,25 @@ class ModelMerger:
         self.train_loaders = train_loaders  # Store train_loaders for use in merge methods
         
     def get_state_dicts(self, models):
-        """Extract state dictionaries from models"""
         return {f"model_{i}": model.state_dict() for i, model in enumerate(models)}
     
     def merge_c2m3(self, models):
-        """
-        Merge models using C2M3 algorithm
-        
-        For FEMNIST models, this ensures:
-        1. The CNN permutation spec is used
-        2. The correct number of classes (62) is set
-        3. Batch norm statistics are properly updated using the train_loaders
-        """
         logger.info("Merging models with C2M3...")
+        
         state_dicts = self.get_state_dicts(models)
         
-        # Get permutation spec for the model architecture
-        # Get appropriate permutation spec builder for the model architecture
-        if self.config.model_name == "cnn":
-            perm_spec_builder = CNNPermutationSpecBuilder()
-            perm_spec = perm_spec_builder.create_permutation_spec()
-        # elif self.config.model_name == "transformer":
-        #     perm_spec_builder = TransformerPermutationSpecBuilder()
-        #     perm_spec = perm_spec_builder.create_permutation_spec()
-        elif self.config.model_name == "auto":
-            # For auto, we would need a reference model and input
-            # This is a placeholder - you'll need to provide the actual model and input
-            perm_spec_builder = AutoPermutationSpecBuilder()
-            ref_model = models[0]  # Use first model as reference
-            ref_input = next(iter(self.train_loaders[0]))[0][:1].to(self.device)  # Get a single batch item
-            perm_spec = perm_spec_builder.create_permutation_spec(ref_model=ref_model, ref_input=ref_input)
+        if self.config.dataset_name == "femnist":
+            builder = CNNPermutationSpecBuilder()
+            logger.info("Using CNN permutation specification for FEMNIST")
+        elif self.config.dataset_name == "cifar10":
+            builder = TinyResNetPermutationSpecBuilder()
+            logger.info("Using ResNet permutation specification for CIFAR10")
         else:
-            raise ValueError(f"Unknown model name for permutation spec: {self.config.model_name}")
+            raise ValueError(f"Unsupported dataset: {self.config.dataset_name}")
         
-        # Create C2M3 merger
+        perm_spec = builder.create_permutation_spec()
         merger = FrankWolfeSynchronizedMerger(
-            name="c2m3",
+            name="c2m3", 
             permutation_spec=perm_spec,
             initialization_method=self.config.c2m3_init_method,
             max_iter=self.config.c2m3_max_iter,
@@ -511,7 +410,46 @@ class ModelMerger:
         else:
             # Use the train_loaders that were passed during initialization
             logger.info("Using train loaders for C2M3 merging to update batch norm statistics.")
-            # Create MyLightningModule instances from state_dicts
+            
+            combined_train_loaders = copy.deepcopy(self.train_loaders)
+            
+            # Try to get a centralized dataset if available
+            centralized_dataset = None
+            if hasattr(self.config, 'central_dir') and self.config.central_dir:
+                centralized_mapping = Path(self.config.central_dir)
+                logger.info(f"Using centralized dataset from {centralized_mapping}")
+                
+                try:
+                    # First try to use the centralized test set
+                    centralized_dataset = load_femnist_dataset(
+                        mapping=centralized_mapping,
+                        name="test",
+                        data_dir=self.config.data_dir,
+                    )
+                    logger.info("Loaded centralized validation dataset")
+                except Exception as e:
+                    logger.info(f"Could not load centralized test dataset: {e}")
+                    logger.info("Using first client's dataset instead")
+                    centralized_dataset = None
+            
+            if centralized_dataset:
+                merged_model_loader = DataLoader(
+                    dataset=centralized_dataset,
+                    batch_size=self.config.batch_size,
+                    shuffle=True,
+                    num_workers=0,
+                    drop_last=True,
+                )
+                logger.info(f"Created merged model loader with centralized dataset, size: {len(centralized_dataset)}")
+            else:
+                # Fallback to using first client's loader
+                merged_model_loader = copy.deepcopy(self.train_loaders[0])
+                logger.info("Using first client's loader as merged model loader")
+            
+            # Insert the merged model's loader at the beginning of the list
+            combined_train_loaders.insert(0, merged_model_loader)
+            logger.info(f"Added merged model loader to train_loaders")
+            
             lightning_modules = {}
             
             if self.config.dataset_name == "femnist":
@@ -523,7 +461,6 @@ class ModelMerger:
             else:
                 raise ValueError(f"Unsupported dataset: {self.config.dataset_name}")
             
-            # Create symbols for models (a, b, c, etc.)
             for i, (model_key, state_dict) in enumerate(state_dicts.items()):
                 symbol = chr(97 + i)  # 'a', 'b', 'c', ...
                 
@@ -531,7 +468,6 @@ class ModelMerger:
                 net = network_generator()
                 net.load_state_dict(state_dict)
                 
-                # Wrap in MyLightningModule
                 if self.config.dataset_name == "femnist":
                     # FEMNIST has 62 classes (letters and digits)
                     num_classes = 62
@@ -546,7 +482,7 @@ class ModelMerger:
                 # Store in dictionary with symbol key
                 lightning_modules[symbol] = mlm
             
-            merged_model, repaired_model, models_permuted_to_universe = merger(lightning_modules, train_loader=self.train_loaders)
+            merged_model, repaired_model, models_permuted_to_universe = merger(lightning_modules, train_loader=combined_train_loaders)
             
             merged_state_dict = repaired_model.model.state_dict()
         
@@ -576,21 +512,16 @@ class ModelMerger:
         num_examples = []  # Track the actual number of examples for each model
         
         for i, model in enumerate(models):
-            # Extract model weights as state_dict
             state_dict = model.state_dict()
-            # Convert to list of numpy arrays (same order as state_dict keys)
             param_list = [param.cpu().numpy() for param in state_dict.values()]
             model_params.append(param_list)
             
-            # Get the actual number of examples in this model's dataset
             dataset_size = len(self.train_loaders[i].dataset)
             num_examples.append(dataset_size)
             logger.info(f"Model {i}: {dataset_size} training examples")
         
-        # Create the list of tuples format that Flower's aggregate function expects
         results = [(model_params[i], num_examples[i]) for i in range(len(models))]
         
-        # Call the aggregation function with the properly formatted input
         aggregated_params = flwr_aggregate(results)
         
         if self.config.dataset_name == "femnist":
@@ -600,50 +531,40 @@ class ModelMerger:
         else:
             raise ValueError(f"Unsupported dataset: {self.config.dataset_name}")
         
-        # Set the aggregated parameters to the model
         with torch.no_grad():
             state_dict = merged_model.state_dict()
-            # Update state dict with aggregated parameters
             for i, (key, _) in enumerate(state_dict.items()):
                 state_dict[key] = torch.tensor(aggregated_params[i])
         
-        # Load the state dict and move model to device
         merged_model.load_state_dict(state_dict)
         merged_model.to(self.device)
         
         return merged_model
     
-    def merge_ties(self, models):
-        """
-        Merge models using TIES algorithm
+    # def merge_ties(self, models):
+    #     """
+    #     Merge models using TIES algorithm
         
-        TIES (Transfusion of Information Elements at Singularities) performs
-        a spatial-wise weighted average of models to address permutation ambiguities
-        without additional optimization.
-        """
-        logger.info("Merging models with TIES...")
+    #     TIES (Transfusion of Information Elements at Singularities) performs
+    #     a spatial-wise weighted average of models to address permutation ambiguities
+    #     without additional optimization.
+    #     """
+    #     logger.info("Merging models with TIES...")
         
-        # Get TIES alpha parameter or use default of 0.5
-        alpha = getattr(self.config, "ties_alpha", 0.5)
+    #     alpha = getattr(self.config, "ties_alpha", 0.5)
         
-        # Apply TIES merging
-        merged_model = merge_models_ties(models, alpha=alpha)
-        merged_model.to(self.device)
+    #     # Apply TIES merging
+    #     merged_model = merge_models_ties(models, alpha=alpha)
+    #     merged_model.to(self.device)
         
-        return merged_model
+    #     return merged_model
     
     def merge_simple_avg(self, models):
         """
         Merge models using simple averaging (equal weights)
-        
-        This differs from fedavg in that it:
-        1. Uses equal weights regardless of dataset size
-        2. Directly averages the parameters without the Flower library
-        3. Is a simpler, more lightweight implementation
         """
-        logger.info("Merging models with simple averaging...")
+        logger.info("Merging models with simple averaging.")
         
-        # Create a new model to hold the merged parameters
         if self.config.dataset_name == "femnist":
             merged_model = get_network_generator_cnn()()
         elif self.config.dataset_name == "cifar10":
@@ -651,10 +572,8 @@ class ModelMerger:
         else:
             raise ValueError(f"Unsupported dataset: {self.config.dataset_name}")
         
-        # Get the state dict of the merged model
         merged_state_dict = merged_model.state_dict()
         
-        # For each parameter in the model
         for key in merged_state_dict.keys():
             # Stack the same parameter from all models
             # Then take the mean along the first dimension (the model dimension)
@@ -670,11 +589,9 @@ class ModelMerger:
         """
         Merge models using element-wise median aggregation
         
-        This method computes the median value for each parameter across all models.
-        It's a robust aggregation method that's less sensitive to outliers than mean-based
-        methods like FedAvg.
+        Computes the median value for each parameter across all models.
         """
-        logger.info("Merging models with median-based aggregation...")
+        logger.info("Merging models with median-based aggregation.")
         
         # Create a new model to hold the merged parameters
         if self.config.dataset_name == "femnist":
@@ -685,22 +602,14 @@ class ModelMerger:
         else:
             raise ValueError(f"Unsupported dataset: {self.config.dataset_name}")
         
-        # Get the state dict of the merged model
         merged_state_dict = merged_model.state_dict()
         
-        # For each parameter in the model
         for key in merged_state_dict.keys():
-            # Stack the same parameter from all models
             stacked_params = torch.stack([model.state_dict()[key].cpu() for model in models])
-            
-            # Compute median along the first dimension (the model dimension)
-            # PyTorch doesn't have a direct median function that keeps gradients,
-            # so we use the numpy median and convert back to torch
+
             if stacked_params.dtype == torch.bool:
-                # For boolean tensors, we use majority voting
                 merged_state_dict[key] = torch.mode(stacked_params, dim=0).values
             else:
-                # For numerical tensors, we use median
                 median_values = torch.from_numpy(
                     np.median(stacked_params.detach().numpy(), axis=0)
                 ).to(stacked_params.dtype)
@@ -738,17 +647,14 @@ class DataManager:
         if not self.data_dir.exists():
             raise FileNotFoundError(f"Data directory {self.data_dir} does not exist")
         
-        # All available client IDs
         self.available_client_ids = []
         
         # Set random seed for client selection
-        # This ensures client selection is reproducible across runs
         self.random_generator = random.Random(config.seed)
         
     def _select_client_ids(self, available_ids, num_clients):
         """Select a subset of client IDs deterministically based on seed"""
         if len(available_ids) >= num_clients:
-            # Use our seeded random generator instead of the global one
             return self.random_generator.sample(available_ids, num_clients)
         else:
             logger.warning(f"Requested {num_clients} clients but only {len(available_ids)} available. Using all available clients.")
@@ -864,7 +770,6 @@ class DataManager:
         Returns:
             Tuple of (train_loaders, val_loaders, test_loader)
         """
-        # Special handling for FEMNIST dataset to ensure proper loading
         if self.dataset_name == "femnist":
             logger.info(f"Creating FEMNIST-specific dataloaders")
             train_loaders = [
@@ -961,11 +866,9 @@ class MergeExperimentRunner:
         self.output_dir = Path(config.output_dir) / self.experiment_name
         self.output_dir.mkdir(exist_ok=True, parents=True)
         
-        # Save configuration
         with open(self.output_dir / "config.json", "w") as f:
             json.dump(asdict(self.config), f, indent=4)
             
-        # Initialize results dictionary
         self.results = {
             "config": asdict(self.config),
             "models": {},
@@ -983,14 +886,10 @@ class MergeExperimentRunner:
         """Setup experiment - load datasets, create models, etc."""
         logger.info(f"Setting up experiment '{self.experiment_name}'...")
         
-        # Setup data
         self.data_manager = DataManager(self.config)
         
-        # Get data references for the specified dataset
         data_refs = self.data_manager.get_dataset()
         
-        # Partition data, getting train, validation, and test partitions
-        # Our corrected implementation returns a single test set that all models will use
         train_partitions, val_partitions, test_set = self.data_manager.partition_data(data_refs, self.config.num_models)
         
         # Create dataloaders
@@ -1005,7 +904,7 @@ class MergeExperimentRunner:
                 network_generator = get_network_generator_cnn()
                 self.models = [network_generator() for _ in range(self.config.num_models)]
                 logger.info(f"Created {len(self.models)} identical FEMNIST models")
-            else: # random initialization
+            else:
                 network_generator = get_network_generator_cnn_random()
                 self.models = [network_generator() for _ in range(self.config.num_models)]
                 logger.info(f"Created {len(self.models)} FEMNIST models with diverse initialization")
@@ -1015,7 +914,7 @@ class MergeExperimentRunner:
                 network_generator = get_network_generator_tiny_resnet()
                 self.models = [network_generator() for _ in range(self.config.num_models)]
                 logger.info(f"Created {len(self.models)} identical CIFAR10 models")
-            else:  # random initialization
+            else:
                 network_generator = get_network_generator_tiny_resnet_random()
                 self.models = [network_generator() for _ in range(self.config.num_models)]
                 logger.info(f"Created {len(self.models)} CIFAR10 models with diverse initialization")
@@ -1029,7 +928,6 @@ class MergeExperimentRunner:
         logger.info(f"Running experiment '{self.experiment_name}'...")
         start_time = time.time()
         
-        # Train individual models
         self.results["models"] = {}
         
         # Add early stopping configuration to results
@@ -1064,7 +962,6 @@ class MergeExperimentRunner:
                 min_delta=early_stopping_min_delta
             )
             
-            # Train and record results with early stopping if enabled
             model_results = trainer.train(
                 epochs, 
                 early_stopping=early_stopping,
@@ -1079,23 +976,18 @@ class MergeExperimentRunner:
                 **model_results
             }
             
-            # Save model if requested
             if self.config.save_models:
                 torch.save(model.state_dict(), self.output_dir / f"model_{i}.pt")
         
-        # Merge models using different methods
         self.results["merged_models"] = {}
         
-        # Initialize model merger with train_loaders
         self.model_merger = ModelMerger(self.config, self.device, self.train_loaders)
         
         for method in self.config.merging_methods:
             logger.info(f"Merging models using {method}...")
             
-            # Merge models
             merged_model = self.model_merger.merge(self.models, method)
             
-            # Evaluate merged model
             trainer = ModelTrainer(
                 merged_model, None, self.test_loader,
                 self.config.learning_rate, self.config.weight_decay,
@@ -1113,7 +1005,6 @@ class MergeExperimentRunner:
             if self.config.save_models:
                 torch.save(merged_model.state_dict(), self.output_dir / f"merged_model_{method}.pt")
         
-        # Record total runtime
         self.results["runtime"] = time.time() - start_time
         
         # Save results
@@ -1135,12 +1026,9 @@ class MergeExperimentRunner:
         sns.set(style="whitegrid")
         plt.figure(figsize=(18, 12))
         
-        # Plot individual model metrics
-        # Create 3x2 grid of subplots for different metrics
         fig, axes = plt.subplots(nrows=3, ncols=2, figsize=(16, 15))
         fig.suptitle(f"Model Training Results - {self.experiment_name}", fontsize=16)
         
-        # Define metrics to plot
         plot_metrics = [
             {"title": "Training Loss", "key": "train_losses", "color": "blue"},
             {"title": "Validation Loss", "key": "val_losses", "color": "green"},
@@ -1150,13 +1038,11 @@ class MergeExperimentRunner:
             {"title": "Test Accuracy", "key": "test_accuracies", "color": "red"},
         ]
         
-        # Additional validation metrics for F1 score and recall in a separate figure
         additional_metrics = [
             {"title": "Validation F1 Score", "key": "val_f1_scores", "color": "purple"},
             {"title": "Validation Recall", "key": "val_recalls", "color": "orange"}
         ]
         
-        # Plot training and evaluation metrics
         for i, metric in enumerate(plot_metrics):
             ax = axes[i//2, i%2]
             ax.set_title(metric["title"])
@@ -1167,17 +1053,13 @@ class MergeExperimentRunner:
             else:
                 ax.set_ylabel("Accuracy")
             
-            # Plot for each model
             for model_idx, model_key in enumerate(sorted(self.results["models"].keys())):
                 model_data = self.results["models"][model_key]
                 
-                # Check if the metric exists for this model
                 if metric["key"] in model_data:
-                    # Get actual number of epochs trained (for early stopping)
                     epochs_trained = model_data.get("epochs_trained", len(model_data[metric["key"]]))
                     x_values = list(range(1, epochs_trained + 1))
                     
-                    # Plot the metric
                     ax.plot(
                         x_values, 
                         model_data[metric["key"]][:epochs_trained], 
@@ -1188,21 +1070,17 @@ class MergeExperimentRunner:
                         markersize=4
                     )
                     
-                    # Mark early stopping point if applicable
                     if model_data.get("early_stopped", False) and "val" in metric["key"] and epochs_trained < model_data["epochs"]:
                         ax.axvline(x=epochs_trained, color=sns.color_palette()[model_idx], linestyle='--', alpha=0.5)
                         ax.scatter([epochs_trained], [model_data[metric["key"]][epochs_trained-1]], 
                                  color=sns.color_palette()[model_idx], s=100, marker='X', 
                                  label=f"Early stop - Model {model_idx+1}" if i == 4 else None)  # Only add label in validation accuracy
             
-            # Set legend for the first plot only to avoid clutter
             if i == 0:
                 ax.legend(loc="best")
         
-        # Adjust layout
         plt.tight_layout(rect=[0, 0, 1, 0.95])  # Adjust rect to make room for suptitle
         
-        # Save the figure if output_dir is set
         if self.config.save_results:
             plt.savefig(self.output_dir / "training_metrics.png", dpi=300, bbox_inches="tight")
         
@@ -1248,11 +1126,9 @@ class MergeExperimentRunner:
             if self.config.save_results:
                 plt.savefig(self.output_dir / "validation_metrics.png", dpi=300, bbox_inches="tight")
         
-        # Plot merged model comparison
         plt.figure(figsize=(10, 6))
         sns.set_style("whitegrid")
         
-        # Extract test accuracies for merged models
         merged_methods = []
         merged_accuracies = []
         
@@ -1260,12 +1136,10 @@ class MergeExperimentRunner:
             merged_methods.append(method)
             merged_accuracies.append(data["test_accuracy"])
         
-        # Calculate average final test accuracy for individual models
         individual_test_accs = [model_data["final_test_acc"] for model_data in self.results["models"].values()]
         avg_individual_acc = sum(individual_test_accs) / len(individual_test_accs)
         best_individual_acc = max(individual_test_accs)
         
-        # Add individual model references
         merged_methods.extend(["Avg Individual", "Best Individual"])
         merged_accuracies.extend([avg_individual_acc, best_individual_acc])
         
@@ -1292,10 +1166,8 @@ class MergeExperimentRunner:
         if self.config.save_results:
             plt.savefig(self.output_dir / "merging_comparison.png", dpi=300, bbox_inches="tight")
         
-        # Display all plots
         plt.show()
         
-        # Print summary statistics
         logger.info("=== Experiment Summary ===")
         logger.info(f"Runtime: {self.results['runtime']:.2f} seconds")
         logger.info("Individual Models:")
@@ -1305,7 +1177,6 @@ class MergeExperimentRunner:
             early_stop_info = f" (early stopped at epoch {model_data.get('epochs_trained', '?')})" if early_stopped else ""
             logger.info(f"  {model_key}: Train Acc={model_data['final_train_acc']:.4f}, Test Acc={model_data['final_test_acc']:.4f}{early_stop_info}")
             
-            # Add validation metrics if available
             if "final_val_acc" in model_data:
                 logger.info(f"    Validation: Acc={model_data['final_val_acc']:.4f}, F1={model_data.get('final_val_f1', 0):.4f}, Recall={model_data.get('final_val_recall', 0):.4f}")
         
@@ -1316,7 +1187,6 @@ class MergeExperimentRunner:
         logger.info(f"Best Individual Model: Test Acc={best_individual_acc:.4f}")
         logger.info(f"Average Individual Model: Test Acc={avg_individual_acc:.4f}")
         
-        # Return summary for programmatic use
         return {
             "merged_models": {method: data["test_accuracy"] for method, data in self.results["merged_models"].items()},
             "best_individual": best_individual_acc,
@@ -1327,10 +1197,8 @@ class MergeExperimentRunner:
 
 def run_parameter_sweep(base_config: MergeExperimentConfig, parameter_grid: Dict[str, List[Any]]):
     """Run experiments with all combinations of parameters in the grid"""
-    # Generate all combinations of parameters
     from itertools import product
     
-    # Get keys and values from parameter grid
     keys = parameter_grid.keys()
     values = parameter_grid.values()
     
@@ -1356,12 +1224,9 @@ def run_parameter_sweep(base_config: MergeExperimentConfig, parameter_grid: Dict
         # Set output directory to parent directory
         config_dict["output_dir"] = str(parent_dir)
         
-        # Create config and runner
         config = MergeExperimentConfig(**config_dict)
         runner = MergeExperimentRunner(config)
-        
         try:
-            # Setup and run experiment
             runner.setup()
             result = runner.run()
             runner.visualize_results()
@@ -1383,33 +1248,24 @@ def run_single_parameter_comparison(base_config, parameter_name, parameter_value
         parameter_values: List of values to use for the parameter
         output_dir: Directory to save the comparison results
     """
-    # Possible values for parameter_name:
-    # - "learning_rate": typically [0.001, 0.01, 0.1]
-    # - "batch_size": typically [16, 32, 64, 128]
-    # - "hidden_size": typically [64, 128, 256, 512]
-    # - "num_epochs": typically [5, 10, 20, 50]
-    # - "weight_decay": typically [0.0, 0.0001, 0.001, 0.01]
-    # - "dropout_rate": typically [0.0, 0.1, 0.2, 0.5]
-    # - "merge_method": typically ["average", "weighted", "task_arithmetic"]
-    # - "merge_weight": typically [0.1, 0.3, 0.5, 0.7, 0.9]
+    # Possible values:
+    # - "learning_rate": [0.001, 0.01, 0.1]
+    # - "num_epochs": [5, 10, 20, 50]
+    # - "merge_method": ["c2m3", "fedavg", "ties", "median"]
     
     # Create parameter grid that only varies one parameter
+    # Then sweep
     parameter_grid = {parameter_name: parameter_values}
     
-    # Run parameter sweep
     results = run_parameter_sweep(base_config, parameter_grid)
     
-    # Create output directory
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True, parents=True)
-    # Extract and organize results for plotting
     comparison_data = []
     
     for result in results:
-        # Get parameter value used in this experiment
         param_value = result["config"][parameter_name]
         
-        # Get metrics for all merging methods
         for method, metrics in result["merged_models"].items():
             comparison_data.append({
                 parameter_name: param_value,
@@ -1417,7 +1273,6 @@ def run_single_parameter_comparison(base_config, parameter_name, parameter_value
                 "test_accuracy": metrics["test_accuracy"]
             })
         
-        # Also add individual model results
         for model_id, model_result in result["models"].items():
             comparison_data.append({
                 parameter_name: param_value,
@@ -1425,13 +1280,9 @@ def run_single_parameter_comparison(base_config, parameter_name, parameter_value
                 "test_accuracy": model_result["final_test_acc"]
             })
     
-    # Convert to DataFrame for easier plotting
     df = pd.DataFrame(comparison_data)
     
-    # Create line plot showing how the parameter affects test accuracy
     plt.figure(figsize=(12, 8))
-    # Use parameter_name for both the column name and the x-axis label
-    # First make sure the parameter name exists as a column in the dataframe
     if parameter_name not in df.columns:
         df["param_value"] = df[parameter_name] if parameter_name in df.columns else None
         sns.lineplot(data=df, x="param_value", y="test_accuracy", hue="method", marker="o")
@@ -1444,10 +1295,7 @@ def run_single_parameter_comparison(base_config, parameter_name, parameter_value
     plt.grid(True)
     plt.tight_layout()
     
-    # Save the plot
     plt.savefig(output_path / f"{parameter_name}_comparison.png", dpi=300)
-    
-    # Save the data
     df.to_csv(output_path / f"{parameter_name}_comparison.csv", index=False)
     
     return df
@@ -1466,32 +1314,23 @@ def run_multiple_seeds_experiment(base_config, seeds, output_dir=None):
     Returns:
         Dictionary with aggregated results across all seeds
     """
-    # Create a meaningful experiment name based on the base config
     base_experiment_name = base_config.experiment_name
     
-    # Set default output directory if not provided
     if output_dir is None:
         output_dir = f"./results/{base_experiment_name}_seeds"
     
-    # Create parameter grid with seeds as the parameter
     parameter_grid = {"seed": seeds}
     
-    # Create a copy of the base config to avoid modifying the original
     from dataclasses import asdict
     config_dict = asdict(base_config)
     config_copy = MergeExperimentConfig(**config_dict)
     
-    # Set output directory for all experiments
     config_copy.output_dir = output_dir
-    
-    # Run parameter sweep with seeds as the parameter
     results = run_parameter_sweep(config_copy, parameter_grid)
     
-    # Create output directory for aggregated results
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True, parents=True)
     
-    # Aggregate results across seeds
     aggregated_results = {
         "config": asdict(base_config),
         "seeds": seeds,
@@ -1500,19 +1339,15 @@ def run_multiple_seeds_experiment(base_config, seeds, output_dir=None):
         "individual_models": {}
     }
     
-    # Extract merged model results
     for method in results[0]["merged_models"].keys():
-        # Extract test accuracies for this method across all seeds
         accuracies = [result["merged_models"][method]["test_accuracy"] for result in results]
         
-        # Calculate statistics
         mean_acc = np.mean(accuracies)
         std_acc = np.std(accuracies)
         median_acc = np.median(accuracies)
         min_acc = np.min(accuracies)
         max_acc = np.max(accuracies)
         
-        # Calculate 95% confidence interval
         n = len(accuracies)
         confidence = 0.95
         degrees_freedom = n - 1
@@ -1521,7 +1356,6 @@ def run_multiple_seeds_experiment(base_config, seeds, output_dir=None):
         ci_lower = mean_acc - ci_margin
         ci_upper = mean_acc + ci_margin
         
-        # Store statistics in aggregated results
         aggregated_results["merged_models"][method] = {
             "accuracies": accuracies,
             "mean": mean_acc,
@@ -1533,22 +1367,18 @@ def run_multiple_seeds_experiment(base_config, seeds, output_dir=None):
             "ci_upper": ci_upper
         }
     
-    # Also aggregate individual model results
     aggregated_results["individual_models"] = {}
     
-    # Calculate best individual model statistics
     best_individual_accs = []
     avg_individual_accs = []
     
     for result in results:
-        # Extract individual model accuracies
         individual_accs = [model_data["final_test_acc"] for model_data in result["models"].values()]
         
         if individual_accs:
             best_individual_accs.append(max(individual_accs))
             avg_individual_accs.append(sum(individual_accs) / len(individual_accs))
     
-    # Calculate statistics for best individual model
     aggregated_results["individual_models"]["best"] = {
         "accuracies": best_individual_accs,
         "mean": np.mean(best_individual_accs),
@@ -1558,7 +1388,6 @@ def run_multiple_seeds_experiment(base_config, seeds, output_dir=None):
         "max": np.max(best_individual_accs)
     }
     
-    # Calculate statistics for average individual model
     aggregated_results["individual_models"]["average"] = {
         "accuracies": avg_individual_accs,
         "mean": np.mean(avg_individual_accs),
@@ -1568,11 +1397,8 @@ def run_multiple_seeds_experiment(base_config, seeds, output_dir=None):
         "max": np.max(avg_individual_accs)
     }
     
-    # Save aggregated results
     with open(output_path / "aggregated_results.json", "w") as f:
         json.dump(aggregated_results, f, indent=4)
-    
-    # Create visualizations
     visualize_seed_aggregated_results(aggregated_results, output_path)
     
     return aggregated_results
@@ -1606,14 +1432,12 @@ def visualize_seed_aggregated_results(aggregated_results, output_dir):
     ci_lowers = []
     ci_uppers = []
     
-    # Add merged model methods
     for method, stats in aggregated_results["merged_models"].items():
         methods.append(method)
         accuracies.append(stats["mean"])
         ci_lowers.append(stats["ci_lower"])
         ci_uppers.append(stats["ci_upper"])
     
-    # Add individual model references
     methods.append("Best Individual")
     accuracies.append(aggregated_results["individual_models"]["best"]["mean"])
     
@@ -1635,7 +1459,7 @@ def visualize_seed_aggregated_results(aggregated_results, output_dir):
     ci_lowers.append(aggregated_results["individual_models"]["average"]["mean"] - avg_ind_ci_margin)
     ci_uppers.append(aggregated_results["individual_models"]["average"]["mean"] + avg_ind_ci_margin)
     
-    # Create DataFrame for plotting
+    # df for plotting
     df = pd.DataFrame({
         "Method": methods,
         "Accuracy": accuracies,
@@ -1643,7 +1467,6 @@ def visualize_seed_aggregated_results(aggregated_results, output_dir):
         "CI_Upper": ci_uppers
     })
     
-    # Create bar plot
     ax = sns.barplot(
         x="Method", 
         y="Accuracy", 
@@ -1652,7 +1475,6 @@ def visualize_seed_aggregated_results(aggregated_results, output_dir):
         capsize=0.2,
     )
     
-    # Add confidence interval as error bars
     for i, row in df.iterrows():
         ax.errorbar(
             i, row["Accuracy"], 
@@ -1662,7 +1484,6 @@ def visualize_seed_aggregated_results(aggregated_results, output_dir):
             capsize=5
         )
     
-    # Add individual data points to show distribution
     for i, method in enumerate(methods):
         if method in aggregated_results["merged_models"]:
             points = aggregated_results["merged_models"][method]["accuracies"]
@@ -1671,12 +1492,10 @@ def visualize_seed_aggregated_results(aggregated_results, output_dir):
         else:  # Avg Individual
             points = aggregated_results["individual_models"]["average"]["accuracies"]
         
-        # Add jittered points
         for point in points:
             jitter = np.random.uniform(-0.2, 0.2)
             plt.scatter(i + jitter, point, color='black', alpha=0.6, s=30)
     
-    # Customize plot
     plt.title(f"Model Merging Methods Comparison Across {aggregated_results['num_seeds']} Seeds", fontsize=16)
     plt.ylabel("Test Accuracy", fontsize=14)
     plt.xlabel("Method", fontsize=14)
@@ -1694,37 +1513,31 @@ def visualize_seed_aggregated_results(aggregated_results, output_dir):
             ha="center", fontsize=12, fontweight='bold'
         )
     
-    # Save figure
     plt.tight_layout()
     plt.savefig(output_dir / "merging_comparison_across_seeds.png", dpi=300, bbox_inches="tight")
     
-    # 2. Create boxplot to show distribution of accuracies
+
+    # 2. Boxplot
     plt.figure(figsize=(12, 8))
     
-    # Prepare data for boxplot
     boxplot_data = []
     
     for method, stats in aggregated_results["merged_models"].items():
         for acc in stats["accuracies"]:
             boxplot_data.append({"Method": method, "Accuracy": acc})
     
-    # Add individual model references
     for acc in aggregated_results["individual_models"]["best"]["accuracies"]:
         boxplot_data.append({"Method": "Best Individual", "Accuracy": acc})
     
     for acc in aggregated_results["individual_models"]["average"]["accuracies"]:
         boxplot_data.append({"Method": "Avg Individual", "Accuracy": acc})
     
-    # Create DataFrame for plotting
     boxplot_df = pd.DataFrame(boxplot_data)
     
-    # Create boxplot
     sns.boxplot(x="Method", y="Accuracy", data=boxplot_df, palette="viridis")
     
-    # Add individual points
     sns.stripplot(x="Method", y="Accuracy", data=boxplot_df, color="black", alpha=0.5, jitter=True)
     
-    # Customize plot
     plt.title(f"Distribution of Test Accuracies Across {aggregated_results['num_seeds']} Seeds", fontsize=16)
     plt.ylabel("Test Accuracy", fontsize=14)
     plt.xlabel("Method", fontsize=14)
@@ -1732,14 +1545,12 @@ def visualize_seed_aggregated_results(aggregated_results, output_dir):
     plt.yticks(fontsize=12)
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     
-    # Save figure
     plt.tight_layout()
     plt.savefig(output_dir / "accuracy_distribution_across_seeds.png", dpi=300, bbox_inches="tight")
     
-    # 3. Create a table with detailed statistics
+    # 3. Statistical summary
     table_data = []
     
-    # Add merged model methods
     for method, stats in aggregated_results["merged_models"].items():
         table_data.append({
             "Method": method,
@@ -1752,7 +1563,6 @@ def visualize_seed_aggregated_results(aggregated_results, output_dir):
             "95% CI Upper": stats["ci_upper"]
         })
     
-    # Add individual model references
     table_data.append({
         "Method": "Best Individual",
         "Mean": aggregated_results["individual_models"]["best"]["mean"],
@@ -1775,26 +1585,23 @@ def visualize_seed_aggregated_results(aggregated_results, output_dir):
         "95% CI Upper": df[df["Method"] == "Avg Individual"]["CI_Upper"].values[0]
     })
     
-    # Create DataFrame for table
     table_df = pd.DataFrame(table_data)
     
-    # Save table as CSV
     table_df.to_csv(output_dir / "statistical_summary.csv", index=False)
     
-    # 4. Create heatmap of improvement over best individual model
+
+    # 4. Improvement over best individual model
     improvement_data = []
     
     for method, stats in aggregated_results["merged_models"].items():
-        # Calculate improvement over best individual model
         improvement = stats["mean"] - aggregated_results["individual_models"]["best"]["mean"]
         
-        # Calculate statistical significance
-        # Use independent t-test
+
         from scipy import stats as scipy_stats
         t_stat, p_value = scipy_stats.ttest_ind(
             stats["accuracies"],
             aggregated_results["individual_models"]["best"]["accuracies"],
-            equal_var=False  # Use Welch's t-test (doesn't assume equal variance)
+            equal_var=False 
         )
         
         improvement_data.append({
@@ -1805,13 +1612,10 @@ def visualize_seed_aggregated_results(aggregated_results, output_dir):
             "Significant": p_value < 0.05
         })
     
-    # Create DataFrame for improvement
     improvement_df = pd.DataFrame(improvement_data)
     
-    # Save improvement data
     improvement_df.to_csv(output_dir / "improvement_statistics.csv", index=False)
     
-    # Create bar plot for improvement
     plt.figure(figsize=(12, 6))
     
     bars = sns.barplot(
@@ -1821,7 +1625,6 @@ def visualize_seed_aggregated_results(aggregated_results, output_dir):
         palette=["green" if x else "red" for x in improvement_df["Significant"]]
     )
     
-    # Add asterisks for significant improvements
     for i, row in improvement_df.iterrows():
         if row["Significant"]:
             plt.text(
@@ -1831,10 +1634,8 @@ def visualize_seed_aggregated_results(aggregated_results, output_dir):
                 ha="center", fontsize=20
             )
     
-    # Add horizontal line at y=0
     plt.axhline(y=0, color='black', linestyle='-', alpha=0.5)
     
-    # Customize plot
     plt.title(f"Improvement Over Best Individual Model", fontsize=16)
     plt.ylabel("Improvement in Test Accuracy", fontsize=14)
     plt.xlabel("Method", fontsize=14)
@@ -1842,11 +1643,9 @@ def visualize_seed_aggregated_results(aggregated_results, output_dir):
     plt.yticks(fontsize=12)
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     
-    # Save figure
     plt.tight_layout()
     plt.savefig(output_dir / "improvement_over_best_individual.png", dpi=300, bbox_inches="tight")
     
-    # Print summary statistics
     logger.info(f"=== Aggregated Results Across {aggregated_results['num_seeds']} Seeds ===")
     logger.info("Merged Models:")
     
@@ -1862,51 +1661,6 @@ def visualize_seed_aggregated_results(aggregated_results, output_dir):
         logger.info(f"  {row['Method']}: {row['Improvement']:.4f} ({significance}, p={row['p_value']:.4f})")
         
 
-def create_comparison_matrix(base_config, param1_name, param1_values, param2_name, param2_values):
-    """Create a matrix of experiments comparing two parameters"""
-    # Create a grid with both parameters
-    parameter_grid = {
-        param1_name: param1_values,
-        param2_name: param2_values
-    }
-    
-    # Run all combinations
-    results = run_parameter_sweep(base_config, parameter_grid)
-    
-    # Create a DataFrame for heatmap visualization
-    heatmap_data = {}
-    
-    # Use the best merging method (e.g., c2m3)
-    method = "c2m3"
-    
-    for result in results:
-        # Get parameter values used in this experiment
-        param1 = result["config"][param1_name]
-        param2 = result["config"][param2_name]
-        
-        # Get accuracy for the selected merging method
-        accuracy = result["merged_models"][method]["test_accuracy"]
-        
-        # Store in nested dictionary
-        if param1 not in heatmap_data:
-            heatmap_data[param1] = {}
-        heatmap_data[param1][param2] = accuracy
-    
-    # Convert to DataFrame
-    df = pd.DataFrame(heatmap_data).T
-    
-    # Create heatmap
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(df, annot=True, cmap="viridis", fmt=".3f")
-    plt.title(f"Test Accuracy using {method} with varying {param1_name} and {param2_name}")
-    plt.xlabel(param2_name)
-    plt.ylabel(param1_name)
-    plt.tight_layout()
-    plt.savefig(f"comparison_{param1_name}_{param2_name}.png", dpi=300)
-    
-    return df
-
-
 def run_increasing_epochs_experiment(base_config, epoch_values):
     """
     Run experiments with same model initialization but increasing epochs.
@@ -1915,35 +1669,26 @@ def run_increasing_epochs_experiment(base_config, epoch_values):
         base_config: Base configuration for experiments
         epoch_values: List of epoch values to train models for (e.g., [5, 10, 20, 30])
     """
-    # Ensure identical initialization
     base_config.initialization_type = "identical"
     
-    # Create the experiment runner with base config
     runner = MergeExperimentRunner(base_config)
     runner.setup()
     
-    # Save the initial state of all models
     initial_states = [model.state_dict().copy() for model in runner.models]
     
     results = []
     
-    # For each epoch setting
     for epochs in epoch_values:
         print(f"Training with {epochs} epochs...")
         
-        # Update config with new epoch value
         base_config.epochs_per_model = [epochs] * base_config.num_models
         runner.config = base_config
         
-        # Reset models to initial state
         for model, initial_state in zip(runner.models, initial_states):
             model.load_state_dict(initial_state)
         
-        # Run the experiment
         result = runner.run()
         results.append(result)
-        
-        # Optional: save visualizations for this epoch setting
         runner.visualize_results()
     
     return results
@@ -1959,16 +1704,12 @@ def run_multi_seed_epochs_experiment(base_config, epoch_values, seeds=[42, 123, 
         epoch_values: Epoch values to use for training models (in ascending order)
         seeds: List of random seeds to use for each run
     """
-    # Make sure epoch values are sorted in ascending order
     epoch_values = sorted(epoch_values)
     
-    # Structure to hold all results
     all_results = {epoch: [] for epoch in epoch_values}
     
-    # Create base experiment name once
     base_experiment_name = base_config.experiment_name
     
-    # Create parent directory for all experiment results
     from pathlib import Path
     parent_dir = Path(f"./results/{base_experiment_name}")
     parent_dir.mkdir(exist_ok=True, parents=True)
@@ -1977,50 +1718,35 @@ def run_multi_seed_epochs_experiment(base_config, epoch_values, seeds=[42, 123, 
     for idx, seed in enumerate(seeds):
         print(f"Using seed {seed}...")
         
-        # Create a new config with the seed changed
         from dataclasses import asdict
         base_config_dict = asdict(base_config)
         
-        # Save original experiment name before removing from dict
         original_name = base_config_dict["experiment_name"]
-        
-        # Remove experiment_name from the dictionary to avoid duplication
         del base_config_dict["experiment_name"]
         
-        # Update the seed 
         base_config_dict["seed"] = seed
-        
-        # Modify the output directory to be within the parent directory
         base_config_dict["output_dir"] = str(parent_dir)
         
-        # Create a runner instance for setup once
-        # We'll use an initial config with the first epoch value for setup
         base_config_dict["epochs_per_model"] = [epoch_values[0]] * base_config.num_models
         initial_config = MergeExperimentConfig(
             **base_config_dict,
             experiment_name=original_name + f"_seed{seed}_incremental"
-        )
-        
-        # Create a runner and do initial setup
+        )        
         runner = MergeExperimentRunner(initial_config)
         runner.setup()
         
-        # Keep track of accumulated epochs for each model
         accumulated_epochs = 0
         
-        # We'll train each epoch interval separately
         for i, target_epoch in enumerate(epoch_values):
             print(f"  Training to epoch {target_epoch}...")
             
-            # Calculate how many more epochs we need to train
             epochs_to_train = target_epoch - accumulated_epochs
             
             if epochs_to_train > 0:
-                # Training for additional epochs
                 for model_idx, (model, train_loader, val_loader) in enumerate(zip(
                     runner.models, runner.train_loaders, runner.val_loaders
                 )):
-                    print(f"    Training model {model_idx+1}/{base_config.num_models} for {epochs_to_train} more epochs...")
+                    print(f"Training model {model_idx+1}/{base_config.num_models} for {epochs_to_train} more epochs...")
                     
                     trainer = ModelTrainer(
                         model, train_loader, runner.test_loader,
@@ -2031,32 +1757,26 @@ def run_multi_seed_epochs_experiment(base_config, epoch_values, seeds=[42, 123, 
                         min_delta=runner.config.early_stopping_min_delta if hasattr(runner.config, "early_stopping_min_delta") else 0.001
                     )
                     
-                    # Train for additional epochs
-                    # Note: early stopping is not used in incremental training as it would complicate the process
                     model_results = trainer.train(
                         epochs_to_train, 
                         early_stopping=False
                     )
                     
-                    # Update model evaluation results in the runner
                     if "models" not in runner.results:
                         runner.results["models"] = {}
                     
                     runner.results["models"][f"model_{model_idx}"] = {
-                        "epochs": target_epoch,  # Total epochs trained so far
-                        "actual_epochs": target_epoch,  # No early stopping
+                        "epochs": target_epoch,
+                        "actual_epochs": target_epoch,
                         "early_stopped": False,
                         **model_results
                     }
             
-            # Update accumulated epochs
             accumulated_epochs = target_epoch
             
-            # Now create copies of the models for merging and evaluation
             original_models = runner.models
             copied_models = [copy.deepcopy(model) for model in original_models]
             
-            # Create a checkpoint-specific config for this evaluation
             checkpoint_config_dict = base_config_dict.copy()
             checkpoint_config_dict["epochs_per_model"] = [target_epoch] * base_config.num_models
             checkpoint_suffix = f"_seed{seed}_epochs{target_epoch}"
@@ -2066,30 +1786,22 @@ def run_multi_seed_epochs_experiment(base_config, epoch_values, seeds=[42, 123, 
                 experiment_name=original_name + checkpoint_suffix
             )
             
-            # Update runner's config for this checkpoint
             runner.config = checkpoint_config
             
-            # Save the original models temporarily
             temp_models = runner.models
             
-            # Set the copied models for merging
             runner.models = copied_models
             
-            # Perform model merging and evaluation
-            # We're reusing the runner's merge logic but with our copied models
             runner.results["merged_models"] = {}
             
-            # Initialize model merger with train_loaders if not already done
             if runner.model_merger is None:
                 runner.model_merger = ModelMerger(runner.config, runner.device, runner.train_loaders)
             
             for method in runner.config.merging_methods:
                 print(f"Merging models using {method} at epoch {target_epoch}...")
                 
-                # Merge models
                 merged_model = runner.model_merger.merge(copied_models, method)
                 
-                # Evaluate merged model
                 trainer = ModelTrainer(
                     merged_model, None, runner.test_loader,
                     runner.config.learning_rate, runner.config.weight_decay,
@@ -2098,25 +1810,21 @@ def run_multi_seed_epochs_experiment(base_config, epoch_values, seeds=[42, 123, 
                 
                 _, test_acc = trainer.evaluate()
                 
-                # Save results
                 runner.results["merged_models"][method] = {
                     "test_accuracy": test_acc
                 }
             
-            # Create a copy of the results for this checkpoint
+            # Create copy for this checkpoint
             checkpoint_result = copy.deepcopy(runner.results)
             
             # Add a field to track which epoch value this run is associated with
             checkpoint_result["tracked_epoch_value"] = target_epoch
             checkpoint_result["config"] = asdict(checkpoint_config)
             
-            # Store the result
             all_results[target_epoch].append(checkpoint_result)
             
-            # Restore the original models for continued training
             runner.models = temp_models
     
-    # Now create visualizations across all seeds and epochs
     visualize_incremental_results(all_results, base_experiment_name, parent_dir)
     
     return all_results
@@ -2142,28 +1850,19 @@ def visualize_incremental_results(all_results, experiment_name, parent_dir):
     # Set style
     sns.set(style="whitegrid")
     
-    # Use provided parent directory
     output_dir = parent_dir
     
-    # Extract methods from first result (assuming all use the same methods)
     first_epoch = list(all_results.keys())[0]
     first_result = all_results[first_epoch][0]
     merging_methods = list(first_result["merged_models"].keys())
     
-    # Initialize data structure for plotting
     plot_data = []
-    
-    # Initialize structure for raw seed-level data
     raw_data = []
     
-    # Process results for each epoch
     for epoch, results_list in all_results.items():
-        # For each merging method, calculate statistics across seeds
         for method in merging_methods:
-            # Extract accuracies for this method across all seeds
             accuracies = [result["merged_models"][method]["test_accuracy"] for result in results_list]
             
-            # Calculate all statistics
             mean_acc = np.mean(accuracies)
             std_acc = np.std(accuracies)
             median_acc = np.median(accuracies)
@@ -2180,7 +1879,6 @@ def visualize_incremental_results(all_results, experiment_name, parent_dir):
             ci_lower = mean_acc - ci_margin
             ci_upper = mean_acc + ci_margin
             
-            # Store aggregated statistics for plotting
             plot_data.append({
                 "Epochs": epoch,
                 "Method": method,
@@ -2193,9 +1891,7 @@ def visualize_incremental_results(all_results, experiment_name, parent_dir):
                 "CI_Upper": ci_upper
             })
             
-            # Store raw seed-level data
             for i, acc in enumerate(accuracies):
-                # Get the corresponding seed from the result
                 seed = results_list[i]["config"]["seed"]
                 raw_data.append({
                     "Epochs": epoch,
@@ -2205,12 +1901,10 @@ def visualize_incremental_results(all_results, experiment_name, parent_dir):
                     "Type": "Merged"
                 })
         
-        # Also calculate for individual models (average and best)
         ind_avg_accs = []
         ind_best_accs = []
         
         for result in results_list:
-            # Extract best and average individual model accuracies
             model_accuracies = [model_data.get("final_test_acc", 0) 
                                for model_data in result["models"].values()]
             
@@ -2240,21 +1934,19 @@ def visualize_incremental_results(all_results, experiment_name, parent_dir):
                     "Type": "Individual"
                 })
         
-        # Calculate stats for average individual models
         avg_ind_mean = np.mean(ind_avg_accs)
         avg_ind_std = np.std(ind_avg_accs)
         avg_ind_median = np.median(ind_avg_accs)
         avg_ind_min = np.min(ind_avg_accs)
         avg_ind_max = np.max(ind_avg_accs)
         
-        # Calculate 95% CI for average individual
+        # 95% CI, average individual
         n = len(ind_avg_accs)
         t_value = stats.t.ppf((1 + confidence) / 2, n - 1)
         ci_margin = t_value * (avg_ind_std / np.sqrt(n))
         ci_lower = avg_ind_mean - ci_margin
         ci_upper = avg_ind_mean + ci_margin
         
-        # Store aggregated stats
         plot_data.append({
             "Epochs": epoch,
             "Method": "Avg Individual",
@@ -2267,21 +1959,18 @@ def visualize_incremental_results(all_results, experiment_name, parent_dir):
             "CI_Upper": ci_upper
         })
         
-        # Calculate stats for best individual models
         best_ind_mean = np.mean(ind_best_accs)
         best_ind_std = np.std(ind_best_accs)
         best_ind_median = np.median(ind_best_accs)
         best_ind_min = np.min(ind_best_accs)
         best_ind_max = np.max(ind_best_accs)
         
-        # Calculate 95% CI for best individual
         n = len(ind_best_accs)
         t_value = stats.t.ppf((1 + confidence) / 2, n - 1)
         ci_margin = t_value * (best_ind_std / np.sqrt(n))
         ci_lower = best_ind_mean - ci_margin
         ci_upper = best_ind_mean + ci_margin
         
-        # Store aggregated stats
         plot_data.append({
             "Epochs": epoch,
             "Method": "Best Individual",
@@ -2294,35 +1983,25 @@ def visualize_incremental_results(all_results, experiment_name, parent_dir):
             "CI_Upper": ci_upper
         })
     
-    # Convert to dataframe
     plot_df = pd.DataFrame(plot_data)
-    
-    # Save this data
     plot_df.to_csv(output_dir / f"incremental_aggregated_results.csv", index=False)
     
-    # Convert raw data to dataframe and save
     raw_df = pd.DataFrame(raw_data)
     raw_df.to_csv(output_dir / f"incremental_raw_results.csv", index=False)
     
-    # Create line plot with error bands for different methods
     plt.figure(figsize=(14, 8))
     
-    # Plot each method
     for method in sorted(set(plot_df["Method"])):
         method_data = plot_df[plot_df["Method"] == method]
         
-        # Skip if we have no data
         if len(method_data) == 0:
             continue
             
-        # Sort by epochs
         method_data = method_data.sort_values("Epochs")
         
-        # Plot the line with confidence interval
         plt.plot(method_data["Epochs"], method_data["Accuracy"], 
                 marker='o', label=method)
         
-        # Add confidence interval
         plt.fill_between(
             method_data["Epochs"],
             method_data["CI_Lower"],
@@ -2330,54 +2009,39 @@ def visualize_incremental_results(all_results, experiment_name, parent_dir):
             alpha=0.2
         )
     
-    # Add labels and title
     plt.title(f"Model Performance by Training Epochs - {experiment_name} (Incremental Training)")
     plt.xlabel("Training Epochs")
     plt.ylabel("Test Accuracy")
     plt.legend()
     plt.grid(True)
     
-    # Save figure
     plt.savefig(output_dir / f"incremental_performance_by_epochs.png", dpi=300, bbox_inches='tight')
     plt.savefig(output_dir / f"incremental_performance_by_epochs.pdf", bbox_inches='tight')
     
-    # Create a violin plot comparing methods at each epoch
     plt.figure(figsize=(18, 10))
     
-    # Filter for only merge methods (exclude individual models)
     merge_methods = [m for m in merging_methods]
     merge_raw_df = raw_df[raw_df["Method"].isin(merge_methods)]
     
-    # Add individual models for comparison
     ind_methods = ["Avg Individual", "Best Individual"]
     ind_raw_df = raw_df[raw_df["Method"].isin(ind_methods)]
     
-    # Combine dataframes
     plot_raw_df = pd.concat([merge_raw_df, ind_raw_df])
     
-    # Create violin plot
     sns.violinplot(x="Epochs", y="Accuracy", hue="Method", data=plot_raw_df, 
                   palette="Set2", split=False, inner="quart")
     
-    # Add labels and title
     plt.title(f"Model Performance Distribution by Training Epochs - {experiment_name} (Incremental Training)")
     plt.xlabel("Training Epochs")
     plt.ylabel("Test Accuracy")
     
-    # Adjust legend
     plt.legend(title="Method", bbox_to_anchor=(1.05, 1), loc='upper left')
     
-    # Save figure
     plt.savefig(output_dir / f"incremental_performance_distribution.png", dpi=300, bbox_inches='tight')
     plt.savefig(output_dir / f"incremental_performance_distribution.pdf", bbox_inches='tight')
     
-    # Create a detailed heatmap showing relative performance to best individual model
-    # This helps understand when merged models outperform the best individual model
-    
-    # First, create a pivot table with epochs as rows and methods as columns
     mean_perf = plot_df.pivot(index="Epochs", columns="Method", values="Accuracy")
     
-    # Calculate relative performance compared to Best Individual
     best_ind_perf = mean_perf["Best Individual"].copy()
     relative_perf = mean_perf.copy()
     
@@ -2386,30 +2050,23 @@ def visualize_incremental_results(all_results, experiment_name, parent_dir):
     
     # Create heatmap
     plt.figure(figsize=(14, 8))
-    
-    # Create the heatmap, excluding the Best Individual column itself
     rel_perf_plot = relative_perf.drop(columns=["Best Individual"], errors='ignore')
     
-    # Create custom diverging colormap centered at 0
     from matplotlib.colors import LinearSegmentedColormap
     colors = ["#d7191c", "#fdae61", "#ffffbf", "#a6d96a", "#1a9641"]
     cmap = LinearSegmentedColormap.from_list("custom_diverging", colors, N=256)
     
-    # Plot the heatmap with custom formatting
     sns.heatmap(rel_perf_plot, annot=True, cmap=cmap, center=0,
                vmin=-10, vmax=10, fmt=".2f", linewidths=0.5, 
                cbar_kws={"label": "% Improvement over Best Individual Model"})
     
-    # Add labels and title
     plt.title(f"Relative Performance Compared to Best Individual Model - {experiment_name} (Incremental Training)")
     plt.xlabel("Merging Method")
     plt.ylabel("Training Epochs")
     
-    # Save the figure
     plt.savefig(output_dir / f"incremental_relative_performance_heatmap.png", dpi=300, bbox_inches='tight')
     plt.savefig(output_dir / f"incremental_relative_performance_heatmap.pdf", bbox_inches='tight')
     
-    # Return the plot dataframe for additional analysis if needed
     return plot_df
 
 
@@ -2429,22 +2086,21 @@ if __name__ == "__main__":
     # )
 
     base_config = MergeExperimentConfig(
-        experiment_name="merge_experiment_iid",
+        experiment_name="merge_experiment_patho",
         dataset_name="femnist",
         model_name="cnn",
         num_models=5,
         batch_size=64,
+        # The key change: provide a list of different sample sizes for each model
+        samples_per_partition=3000,
+        data_distribution="pathological",
         initialization_type="identical",
-        # seed will be set in the function
         merging_methods=["c2m3", "fedavg", "simple_avg", "median"],
-        data_distribution="iid"
     )
 
     epoch_values = [5, 10, 15, 20, 25]
-    seeds = [42, 123, 456, 789, 101]  # 5 random seeds as requested
+    seeds = [42, 123, 456, 789, 101] 
     
-    # Run the multi-seed exWrite me a litmus test to differentiate between LDAR and LDAPR periment
     results = run_multi_seed_epochs_experiment(base_config, epoch_values, seeds)
     
     print("All experiment results are now organized in the results/merge_experiment_random_cnn directory")
-    print("You can reproduce all visualizations using the saved CSV and JSON data in this directory")

@@ -14,6 +14,14 @@ from c2m3.utils.utils import fuse_batch_norm_into_conv, l2_norm_models, get_mode
 logger = logging.getLogger(__name__)
 
 def repair_model(model_to_repair, models, train_loader):
+    # Check if the model has batch normalization layers
+    has_bn = False
+    for name, module in model_to_repair.named_modules():
+        if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            has_bn = True
+            break
+    logger.info(f"Model has BN: {has_bn}")
+    
     model_to_repair = copy.deepcopy(model_to_repair)
 
     if torch.cuda.is_available():

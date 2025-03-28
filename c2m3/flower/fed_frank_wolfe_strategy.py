@@ -1,6 +1,7 @@
 from logging import DEBUG, WARNING
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple, Union
+import copy
 
 from flwr.common import (
     EvaluateIns,
@@ -47,8 +48,8 @@ than or equal to the values of `min_fit_clients` and `min_evaluate_clients`.
 NUM_CLASSES_FEMNIST = 62
 
 # Todo dont hardcode these
-home_dir = Path.cwd() / ".."
-dataset_dir: Path = home_dir / "femnist"
+home_dir = Path(__file__).parent / ".."
+dataset_dir: Path = home_dir / "data" / "femnist"
 data_dir: Path = dataset_dir / "data"
 
 # weights_results: List(Tuple(NDArray parameters, number of examples))
@@ -282,6 +283,47 @@ class FrankWolfeSync(Strategy):
                 drop_last=True,
             )
             train_loaders.append(train_loader)
+            
+        if train_loaders:
+            # Get the centralized dataset which should be representative for the merged model
+            centralized_mapping = Path(config["central_dir"])
+            print(f'{centralized_mapping=}')
+            try:
+                # First try to use the validation set
+                centralized_dataset = load_femnist_dataset(
+                    mapping=centralized_mapping,
+                    name="val",  # Use validation set as it's representative
+                    data_dir=data_dir,
+                )
+                
+            except:
+                # Fallback to train set if validation isn't available
+                try:
+                    centralized_dataset = load_femnist_dataset(
+                        mapping=centralized_mapping,
+                        name="test",
+                        data_dir=data_dir,
+                    )
+                except:
+                    log(WARNING, f"Could not load centralized dataset, using first client's dataset instead")
+                    centralized_dataset = None
+            
+            if centralized_dataset:
+                # Create a dataloader for the merged model using the centralized dataset
+                merged_model_loader = DataLoader(
+                    dataset=centralized_dataset,
+                    batch_size=batch_size,
+                    shuffle=True,
+                    num_workers=num_workers,
+                    drop_last=True,
+                )
+            else:
+                # Fallback to using first client's loader
+                merged_model_loader = copy.deepcopy(train_loaders[0])
+                
+            # Insert the merged model's loader at the beginning of the list
+            train_loaders.insert(0, merged_model_loader)
+        
         parameters_aggregated = ndarrays_to_parameters(frank_wolfe_aggregate(weights_results, train_loaders))
 
         # Aggregate custom metrics if aggregation fn was provided

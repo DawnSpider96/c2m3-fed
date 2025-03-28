@@ -1,0 +1,47 @@
+{
+    "experiment_name": "varied_sample_sizes_iid_spreaded_seed789_incremental",
+    "dataset_name": "femnist",
+    "model_name": "cnn",
+    "seed": 789,
+    "data_dir": "/home/dawn/repos/c2m3-fed/c2m3/data",
+    "num_models": 5,
+    "epochs_per_model": [
+        5,
+        5,
+        5,
+        5,
+        5
+    ],
+    "batch_size": 64,
+    "learning_rate": 0.01,
+    "weight_decay": 0.0001,
+    "early_stopping": false,
+    "early_stopping_patience": 5,
+    "early_stopping_min_delta": 0.001,
+    "early_stopping_metric": "accuracy",
+    "data_distribution": "iid",
+    "non_iid_alpha": 5.0,
+    "classes_per_partition": 1,
+    "samples_per_partition": [
+        5000,
+        4000,
+        2000,
+        750,
+        600
+    ],
+    "initialization_type": "identical",
+    "merging_methods": [
+        "c2m3",
+        "fedavg",
+        "simple_avg",
+        "median"
+    ],
+    "c2m3_max_iter": 300,
+    "c2m3_score_tolerance": 1e-06,
+    "c2m3_init_method": "identity",
+    "ties_alpha": 0.5,
+    "eval_batch_size": 128,
+    "output_dir": "results/varied_sample_sizes_iid_spreaded",
+    "save_models": false,
+    "save_results": true
+}

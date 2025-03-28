@@ -241,7 +241,7 @@ def train_femnist(
     # Check for division by zero
     if total == 0:
         print("Warning: No data was processed during training. Dataset might be empty.")
-        return 0.0  # Return 0 loss instead of causing division by zero
+        return 0.0
     
     return running_loss / total
 
